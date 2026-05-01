@@ -116,5 +116,5 @@ Provided by `quirm-secrets` SealedSecret in `agents-shared`:
 | `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID_QUIRM` | shared bot, dedicated chat |
 | `NTFY_TOKEN` | regression alerts |
 | `OFP_SHARED_SECRET` | A2A mutual auth |
-| `OP_SERVICE_ACCOUNT_TOKEN` | 1Password for credential lookup |
+| `BW_CLIENTID` + `BW_CLIENTSECRET` | Vaultwarden API-key login (`bw login --apikey`) for ad-hoc credential lookups |
 | `HEALTHCHECKS_UUID` | per-agent UUID for hc-ping.com heartbeats |

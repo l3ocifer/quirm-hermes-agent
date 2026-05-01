@@ -22,7 +22,7 @@ RUN apt-get update \
       libssl-dev libffi-dev \
       sqlite3 \
       postgresql-client \
-      jq ripgrep \
+      jq ripgrep unzip \
       ffmpeg \
       gnupg lsb-release \
  && rm -rf /var/lib/apt/lists/*
@@ -33,15 +33,22 @@ RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kub
       -o /usr/local/bin/kubectl \
  && chmod +x /usr/local/bin/kubectl
 
-# 1Password CLI for credential lookups
-RUN curl -sSfO https://downloads.1password.com/linux/keys/1password.asc \
- && gpg --dearmor 1password.asc \
- && mv 1password.asc.gpg /usr/share/keyrings/1password-archive-keyring.gpg \
- && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/$(dpkg --print-architecture) stable main" \
-      > /etc/apt/sources.list.d/1password.list \
- && apt-get update \
- && apt-get install -y --no-install-recommends 1password-cli \
- && rm -rf /var/lib/apt/lists/* 1password.asc
+# Bitwarden CLI (`bw`) — credential lookups against the cluster's
+# Vaultwarden (https://warden.leopaska.xyz). Persistent Quirm creds
+# arrive via SealedSecrets → envFrom; `bw` is here for ad-hoc lookups
+# inside benchmarking / capability-research skills.
+ARG BW_VERSION=2026.4.1
+RUN ARCH="$(dpkg --print-architecture)" \
+ && case "$ARCH" in \
+      amd64) BW_ARCH=linux ;; \
+      arm64) BW_ARCH=linux-arm64 ;; \
+      *) echo "unsupported arch: $ARCH" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL "https://github.com/bitwarden/clients/releases/download/cli-v${BW_VERSION}/bw-oss-${BW_ARCH}-${BW_VERSION}.zip" \
+        -o /tmp/bw.zip \
+ && unzip -q /tmp/bw.zip -d /usr/local/bin \
+ && chmod +x /usr/local/bin/bw \
+ && rm -f /tmp/bw.zip
 
 # Install Hermes from the LOCAL fork source (not from PyPI — upstream
 # does not publish to PyPI). uv is faster than pip for the install.
