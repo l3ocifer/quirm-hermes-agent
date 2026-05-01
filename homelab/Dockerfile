@@ -49,13 +49,6 @@ RUN curl -sSfO https://downloads.1password.com/linux/keys/1password.asc \
 RUN pip install --no-cache-dir uv
 
 WORKDIR /opt/hermes
-COPY pyproject.toml MANIFEST.in README.md ./
-COPY agent ./agent
-COPY acp_adapter ./acp_adapter
-COPY acp_registry ./acp_registry
-COPY website* ./website 2>/dev/null || true
-# Copy any other top-level dirs that pyproject references — adjust if
-# upstream restructures. The .dockerignore keeps homelab/ out of context.
 COPY . .
 
 RUN uv pip install --system --no-cache "." \
