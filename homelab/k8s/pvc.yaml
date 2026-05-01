@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: quirm-state
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: quirm
+    app.kubernetes.io/component: state
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn-single
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,81 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Sunday 03:00 UTC — staggered after Frick (02:45),
+    # before Vimes (03:15) and Puck (03:30).
+    - cron: "0 3 * * 0"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM: https://github.com/NousResearch/hermes-agent.git
+  UPSTREAM_BRANCH: main
+  PR_BRANCH: chore/sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream "${UPSTREAM}" || git remote set-url upstream "${UPSTREAM}"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Check if upstream has new commits
+        id: ahead
+        run: |
+          BEHIND=$(git rev-list --count main..upstream/${UPSTREAM_BRANCH})
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/${UPSTREAM_BRANCH})
+          echo "upstream_short=$UPSTREAM_SHORT" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if already in sync
+        if: steps.ahead.outputs.behind == '0'
+        run: echo "Already up to date."
+
+      - name: Create or update sync branch
+        if: steps.ahead.outputs.behind != '0'
+        id: branch
+        run: |
+          BRANCH="${PR_BRANCH}-${{ steps.ahead.outputs.upstream_short }}"
+          echo "name=$BRANCH" >> "$GITHUB_OUTPUT"
+          git switch -C "$BRANCH"
+          if git merge --no-edit upstream/${UPSTREAM_BRANCH}; then
+            echo "Merge clean."
+          else
+            git add -A
+            git commit -m "merge: upstream conflicts (manual resolution required)" --no-verify || true
+          fi
+          git push -f origin "$BRANCH"
+
+      - name: Open or update PR
+        if: steps.ahead.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.name }}
+          BEHIND: ${{ steps.ahead.outputs.behind }}
+          SHORT: ${{ steps.ahead.outputs.upstream_short }}
+        run: |
+          if gh pr view "$BRANCH" --json number > /dev/null 2>&1; then
+            echo "PR already exists — pushed updates."
+          else
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore: sync upstream hermes-agent@${SHORT}" \
+              --body "Automated upstream sync. Upstream NousResearch/hermes-agent@${SHORT}, behind by ${BEHIND} commits."
+          fi

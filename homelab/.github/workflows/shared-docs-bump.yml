@@ -1,0 +1,50 @@
+name: Bump shared docs submodule
+
+on:
+  repository_dispatch:
+    types: [shared-docs-updated]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, submodules: true, token: "${{ secrets.GITHUB_TOKEN }}" }
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - id: bump
+        run: |
+          cd homelab/shared
+          OLD=$(git rev-parse --short HEAD)
+          git fetch origin main && git checkout main && git pull origin main
+          NEW=$(git rev-parse --short HEAD)
+          cd ../..
+          echo "old=$OLD" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          [ "$OLD" = "$NEW" ] && echo "skip=1" >> "$GITHUB_OUTPUT" || true
+
+      - if: steps.bump.outputs.skip != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OLD: ${{ steps.bump.outputs.old }}
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          set -euo pipefail
+          BRANCH="chore/shared-docs-${NEW}"
+          git switch -C "$BRANCH"
+          git add homelab/shared
+          git commit -m "chore: bump shared docs ${OLD} → ${NEW}"
+          git push -f origin "$BRANCH"
+          gh pr view "$BRANCH" --json number > /dev/null 2>&1 || \
+            gh pr create --base main --head "$BRANCH" \
+              --title "chore: bump shared docs ${OLD} → ${NEW}" \
+              --body "Auto-generated from l3ocifer/homelab shared-docs update."

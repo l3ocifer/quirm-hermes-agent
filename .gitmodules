@@ -1,3 +1,6 @@
 [submodule "tinker-atropos"]
 	path = tinker-atropos
 	url = https://github.com/nousresearch/tinker-atropos
+[submodule "homelab/shared"]
+	path = homelab/shared
+	url = https://github.com/l3ocifer/homelab.git

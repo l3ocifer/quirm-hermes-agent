@@ -1,0 +1,102 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quirm
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: quirm
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: agents
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                    # state PVC is RWO
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: quirm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quirm
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: quirm-ops
+      restartPolicy: Always
+      affinity:
+        nodeAffinity:
+          # Soft-prefer thebeast (192 GB RAM — benchmarking benefits
+          # from headroom for parallel sub-agent runs).
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 70
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [thebeast] }
+            - weight: 30
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: [alef] }
+      securityContext:
+        runAsNonRoot: false
+        fsGroup: 0
+      containers:
+        - name: hermes
+          image: ghcr.io/l3ocifer/quirm-hermes-agent:latest
+          imagePullPolicy: Always
+          command: ["hermes"]
+          args:
+            - "gateway"
+            - "--config=/home/hermes/.hermes/config.toml"
+            - "--bind=0.0.0.0"
+            - "--port=3001"
+          env:
+            - { name: AGENT_NAME, value: "Quirm" }
+            - { name: AGENT_ID, value: "quirm" }
+            - { name: HERMES_CONFIG, value: "/home/hermes/.hermes/config.toml" }
+            - { name: TZ, value: "America/New_York" }
+            - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-QUIRM" }
+          envFrom:
+            - secretRef: { name: quirm-secrets }
+          ports:
+            - { name: gateway, containerPort: 3001, protocol: TCP }
+            - { name: metrics, containerPort: 9100, protocol: TCP }
+          livenessProbe:
+            httpGet: { path: /health, port: gateway }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+          readinessProbe:
+            httpGet: { path: /health, port: gateway }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "500m", memory: "2Gi" }
+            limits:   { memory: "6Gi" }
+          volumeMounts:
+            - { name: state,           mountPath: /home/hermes/.hermes }
+            - { name: state,           mountPath: /data, subPath: hardstop }
+            - { name: persona,         mountPath: /home/hermes/.hermes/workspace, readOnly: true }
+            - { name: hermes-config,   mountPath: /home/hermes/.hermes/config.toml, subPath: config.toml, readOnly: true }
+            - { name: graph-quirm,     mountPath: /data/graphs/quirm }
+            - { name: graph-frick,     mountPath: /data/graphs/frick,    readOnly: true }
+            - { name: graph-frack,     mountPath: /data/graphs/frack,    readOnly: true }
+            - { name: graph-sancho,    mountPath: /data/graphs/sancho,   readOnly: true }
+            - { name: graph-vetinari,  mountPath: /data/graphs/vetinari, readOnly: true }
+            - { name: graph-vimes,     mountPath: /data/graphs/vimes,    readOnly: true }
+            - { name: graph-puck,      mountPath: /data/graphs/puck,     readOnly: true }
+            - { name: graph-leo,       mountPath: /data/graphs/leo }
+              # Restricted writes per HANDOFF.md §4 — runtime-enforced
+      volumes:
+        - { name: state,         persistentVolumeClaim: { claimName: quirm-state } }
+        - { name: persona,       configMap: { name: quirm-persona } }
+        - { name: hermes-config, configMap: { name: quirm-hermes-config } }
+        - { name: graph-quirm,    persistentVolumeClaim: { claimName: quirm-graph } }
+        - { name: graph-frick,    persistentVolumeClaim: { claimName: frick-graph } }
+        - { name: graph-frack,    persistentVolumeClaim: { claimName: frack-graph } }
+        - { name: graph-sancho,   persistentVolumeClaim: { claimName: sancho-graph } }
+        - { name: graph-vetinari, persistentVolumeClaim: { claimName: vetinari-graph } }
+        - { name: graph-vimes,    persistentVolumeClaim: { claimName: vimes-graph } }
+        - { name: graph-puck,     persistentVolumeClaim: { claimName: puck-graph } }
+        - { name: graph-leo,      persistentVolumeClaim: { claimName: leo-graph } }
+      imagePullSecrets:
+        - { name: ghcr-credentials }

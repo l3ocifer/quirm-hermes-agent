@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quirm
+  namespace: agents-shared
+  labels:
+    app.kubernetes.io/name: quirm
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: quirm
+  ports:
+    - { name: gateway, port: 3001, targetPort: gateway, protocol: TCP }
+    - { name: metrics, port: 9100, targetPort: metrics, protocol: TCP }
