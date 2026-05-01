@@ -41,7 +41,7 @@ spec:
         fsGroup: 0
       containers:
         - name: hermes
-          image: ghcr.io/l3ocifer/quirm-hermes-agent:latest
+          image: ghcr.io/l3ocifer/quirm-hermes-agent:homelab
           imagePullPolicy: Always
           command: ["hermes"]
           args:
