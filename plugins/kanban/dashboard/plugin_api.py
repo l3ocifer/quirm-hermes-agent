@@ -31,6 +31,7 @@ import hmac
 import json
 import logging
 import sqlite3
+import sys
 import time
 from dataclasses import asdict
 from typing import Any, Optional
@@ -59,13 +60,15 @@ def _check_ws_token(provided: Optional[str]) -> bool:
     """
     if not provided:
         return False
-    try:
-        from hermes_cli import web_server as _ws
-    except Exception:
-        # No dashboard context (tests). Accept so the tail loop is still
-        # testable; in production the dashboard module always imports
-        # cleanly because it's the caller.
-        return True
+    _ws = sys.modules.get("hermes_cli.web_server")
+    if _ws is None:
+        try:
+            from hermes_cli import web_server as _ws
+        except Exception:
+            # No dashboard context (tests). Accept so the tail loop is still
+            # testable; in production the dashboard module always imports
+            # cleanly because it's the caller.
+            return True
     expected = getattr(_ws, "_SESSION_TOKEN", None)
     if not expected:
         return True

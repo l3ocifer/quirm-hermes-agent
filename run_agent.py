@@ -9387,10 +9387,12 @@ class AIAgent:
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
             else:
-                guardrail_decision = self._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = self._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                tool_guardrails = getattr(self, "_tool_guardrails", None)
+                if tool_guardrails is not None:
+                    guardrail_decision = tool_guardrails.before_call(function_name, function_args)
+                    if not guardrail_decision.allows_execution:
+                        block_result = self._guardrail_block_result(guardrail_decision)
+                        blocked_by_guardrail = True
 
             parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail))
 
