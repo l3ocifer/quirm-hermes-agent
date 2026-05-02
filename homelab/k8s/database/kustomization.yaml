@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Quirm's database substrate — lives in the `databases` namespace
+# alongside the homelab-pg cluster, NOT in agents-shared like the rest
+# of Quirm's manifests. The CNPG `Database` CRD is required to
+# live in the same namespace as its parent `Cluster`, and the
+# role-bootstrap Job needs the homelab-pg-app secret which only exists
+# in `databases`.
+#
+# Owned by a separate ArgoCD Application (`quirm-database`) so that
+# the namespace rewriting on the main `quirm` app (which sets
+# `namespace: agents-shared`) doesn't leak into here.
+#
+# Sync waves (annotated on individual resources):
+#   wave 0  → role-bootstrap-job   (CREATE ROLE / GRANT — runs first)
+#   wave 1  → database.yaml        (CREATE DATABASE — needs the role)
+
+namespace: databases
+
+resources:
+  - role-bootstrap-job.yaml
+  - database.yaml
+
+commonLabels:
+  app.kubernetes.io/name: quirm
+  app.kubernetes.io/component: agent-database
+  app.kubernetes.io/part-of: agents
+  app.kubernetes.io/managed-by: argocd

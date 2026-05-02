@@ -93,3 +93,15 @@ prompt   = "Run the daily benchmark digest. Compare yesterday's runs to the trai
 [[cron.tasks]]
 schedule = "0 9 * * 0"
 prompt   = "Weekly methodology review. Re-run any benchmark from the past 7 days that produced surprising results. Check statistical significance. Update the eval harness if any rubric needs revision. Post a one-page memo to quirm-graph/pages/memos/. Send vimes a list of any new prototypes from the past week so he can flag any that should not deploy."
+
+# ─── Fleet event bus ─────────────────────────────────────────────────
+# Durable async A2A backbone shared by all seven agents. Connection
+# string sealed in quirm-secrets as FLEET_DATABASE_URL.
+[fleet]
+enabled = true
+agent_id = "quirm"
+database_url_env = "FLEET_DATABASE_URL"
+notify_channel = "fleet_events_new"
+# Quirm is the research/benchmarking agent — wakes for P0s, broadcasts,
+# explicit pings, plus any benchmark/eval/research event.
+inbound_predicate = "severity = 'p0' OR target IS NULL OR target = 'quirm' OR kind LIKE 'research.%' OR kind LIKE 'eval.%' OR kind LIKE 'benchmark.%'"
