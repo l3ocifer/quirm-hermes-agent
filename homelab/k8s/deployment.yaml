@@ -57,7 +57,8 @@ spec:
             - { name: WEBHOOK_ENABLED, value: "true" }
             - { name: WEBHOOK_PORT, value: "3001" }
             - { name: MATRIX_HOMESERVER, value: "https://conduit.leopaska.xyz" }
-            - { name: MATRIX_USER_ID, value: "@quirm:conduit.leopaska.xyz" }
+            - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
+            - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }
             - { name: TZ, value: "America/New_York" }
             - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-QUIRM" }
           envFrom:

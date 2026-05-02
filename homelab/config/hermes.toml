@@ -13,7 +13,7 @@ bind = "0.0.0.0:3001"
 metrics_bind = "0.0.0.0:9100"
 
 [providers.litellm]
-base_url = "http://litellm.litellm.svc:4000/v1"
+base_url = "http://litellm.inference.svc.cluster.local:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 default_model = "chat"
 

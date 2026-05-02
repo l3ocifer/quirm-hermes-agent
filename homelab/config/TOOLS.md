@@ -20,7 +20,7 @@
 
 ## Models
 
-Quirm calls models via LiteLLM (`http://litellm.litellm.svc:4000/v1`).
+Quirm calls models via LiteLLM (`http://litellm.inference.svc.cluster.local:4000/v1`).
 Configured aliases in `hermes.toml`:
 
 | Alias | Use |
