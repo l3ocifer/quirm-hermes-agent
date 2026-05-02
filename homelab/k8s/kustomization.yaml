@@ -28,7 +28,7 @@ configMapGenerator:
       - config.toml=../config/hermes.toml
 
 generatorOptions:
-  disableNameSuffixHash: false
+  disableNameSuffixHash: true
 
 commonLabels:
   app.kubernetes.io/name: quirm
