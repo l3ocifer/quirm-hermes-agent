@@ -46,13 +46,18 @@ spec:
           command: ["hermes"]
           args:
             - "gateway"
-            - "--config=/home/hermes/.hermes/config.toml"
-            - "--bind=0.0.0.0"
-            - "--port=3001"
+            - "run"
           env:
             - { name: AGENT_NAME, value: "Quirm" }
             - { name: AGENT_ID, value: "quirm" }
             - { name: HERMES_CONFIG, value: "/home/hermes/.hermes/config.toml" }
+            - { name: GATEWAY_HOST, value: "0.0.0.0" }
+            - { name: GATEWAY_PORT, value: "3001" }
+            - { name: GATEWAY_ALLOW_ALL_USERS, value: "true" }
+            - { name: WEBHOOK_ENABLED, value: "true" }
+            - { name: WEBHOOK_PORT, value: "3001" }
+            - { name: MATRIX_HOMESERVER, value: "https://conduit.leopaska.xyz" }
+            - { name: MATRIX_USER_ID, value: "@quirm:conduit.leopaska.xyz" }
             - { name: TZ, value: "America/New_York" }
             - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-QUIRM" }
           envFrom:
