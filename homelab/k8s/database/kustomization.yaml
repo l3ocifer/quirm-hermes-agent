@@ -22,8 +22,10 @@ resources:
   - role-bootstrap-job.yaml
   - database.yaml
 
-commonLabels:
-  app.kubernetes.io/name: quirm
-  app.kubernetes.io/component: agent-database
-  app.kubernetes.io/part-of: agents
-  app.kubernetes.io/managed-by: argocd
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/name: quirm
+      app.kubernetes.io/component: agent-database
+      app.kubernetes.io/part-of: agents
+      app.kubernetes.io/managed-by: argocd

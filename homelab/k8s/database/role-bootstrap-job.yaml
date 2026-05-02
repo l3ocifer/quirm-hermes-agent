@@ -14,7 +14,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  generateName: quirm-role-bootstrap-
+  name: quirm-role-bootstrap
   namespace: databases
   annotations:
     argocd.argoproj.io/sync-wave: "0"
