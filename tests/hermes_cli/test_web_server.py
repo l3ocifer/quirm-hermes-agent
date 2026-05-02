@@ -2199,7 +2199,11 @@ class TestPtyWebSocket:
 
             with self.client.websocket_connect(pub_path) as pub:
                 pub.send_text('{"type":"tool.start","payload":{"tool_id":"t1"}}')
-                received = sub.receive_text()
+                # Close the publisher before waiting on the subscriber so the
+                # TestClient portal always gets a scheduling point to process
+                # the publish loop and fan out the frame.
+                pub.close()
+            received = sub.receive_text()
 
         assert "tool.start" in received
         assert '"tool_id":"t1"' in received
