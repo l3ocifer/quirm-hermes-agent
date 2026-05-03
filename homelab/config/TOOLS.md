@@ -39,9 +39,10 @@ agents see, so what Quirm sees needs to be that.
 
 | Channel | Use |
 |---|---|
-| Matrix `@quirm:leopaska.xyz` | weekly digests + on-demand reports to Leo + Vetinari briefings |
-| Telegram bot (shared) | morning benchmark summary at 06:00 ET |
-| ntfy `ntfy.leopaska.xyz/quirm` | regression alerts (P95 latency > +20%, cost spikes) |
+| BlueBubbles/iMessage | user-facing digests, on-demand reports to Leo, and regression alerts |
+| Matrix `@quirm:leopaska.xyz` | fallback and sibling coordination only |
+| Telegram bot (shared) | tertiary fallback |
+| ntfy `ntfy.leopaska.xyz/quirm` | legacy fallback only |
 | A2A — peer to all 6 siblings | timed benchmark calls, cost-tagged via virtual key |
 | HTTP API `:3001` | exposes `/bench/run`, `/bench/history`, `/eval/<set>/results`, `/proto/<id>` |
 

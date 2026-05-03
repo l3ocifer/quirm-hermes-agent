@@ -24,8 +24,7 @@ url_env = "DATABASE_URL"
 [memory.logseq]
 graphs = [
   { id = "quirm",    path = "/data/graphs/quirm",    writable = true },
-  { id = "leo",      path = "/data/graphs/leo",      writable = true,
-    writable_paths = ["pages/agent-coordination/", "pages/research-memos/"] },
+  { id = "leo",      path = "/data/graphs/leo",      writable = true, writable_paths = ["pages/agent-coordination/", "pages/research-memos/"] },
   { id = "frick",    path = "/data/graphs/frick",    writable = false },
   { id = "frack",    path = "/data/graphs/frack",    writable = false },
   { id = "sancho",   path = "/data/graphs/sancho",   writable = false },
@@ -35,8 +34,8 @@ graphs = [
 ]
 
 [tools]
-enabled = ["terminal", "code-execution", "web-search", "browser", "memory", "mcp"]
-disabled = ["bluebubbles", "homeassistant", "stripe", "kubectl-write"]
+enabled = ["terminal", "code-execution", "web-search", "browser", "memory", "mcp", "bluebubbles"]
+disabled = ["homeassistant", "stripe", "kubectl-write"]
 
 [tools.terminal]
 backend = "docker"
@@ -73,6 +72,7 @@ url = "http://puck.agents-shared.svc:18789"
 matrix   = { homeserver_env = "MATRIX_HOMESERVER", token_env = "MATRIX_ACCESS_TOKEN", user = "@quirm:leopaska.xyz" }
 telegram = { token_env = "TELEGRAM_BOT_TOKEN", chat_id_env = "TELEGRAM_CHAT_ID_QUIRM" }
 ntfy     = { url = "https://ntfy.leopaska.xyz/quirm", token_env = "NTFY_TOKEN" }
+bluebubbles = { base_url = "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080", api_key_env = "BLUEBUBBLES_API_KEY", webhook_path = "/imessage/inbound" }
 
 [quiet_hours]
 start = "22:00"
@@ -88,11 +88,13 @@ every_minutes = 30
 [cron]
 [[cron.tasks]]
 schedule = "0 6 * * *"
-prompt   = "Run the daily benchmark digest. Compare yesterday's runs to the trailing 7-day window. Flag any P95 latency regression > 20% or cost increase > 30%. Post the summary to my Telegram channel and to vetinari (A2A) so he has it for the morning briefing. Save the full report to quirm-graph/pages/runs/."
+prompt   = "Run the daily benchmark digest. Compare yesterday's runs to the trailing 7-day window. Flag any P95 latency regression > 20% or cost increase > 30%. Send the user-facing summary via BlueBubbles/iMessage and to vetinari (A2A) so he has it for the morning briefing. Save the full report to quirm-graph/pages/runs/."
+delivery = ["bluebubbles"]
 
 [[cron.tasks]]
 schedule = "0 9 * * 0"
-prompt   = "Weekly methodology review. Re-run any benchmark from the past 7 days that produced surprising results. Check statistical significance. Update the eval harness if any rubric needs revision. Post a one-page memo to quirm-graph/pages/memos/. Send vimes a list of any new prototypes from the past week so he can flag any that should not deploy."
+prompt   = "Weekly methodology review. Re-run any benchmark from the past 7 days that produced surprising results. Check statistical significance. Update the eval harness if any rubric needs revision. Post a one-page memo to quirm-graph/pages/memos/. Send the user-facing summary via BlueBubbles/iMessage, and send vimes a list of any new prototypes from the past week so he can flag any that should not deploy."
+delivery = ["bluebubbles"]
 
 # ─── Fleet event bus ─────────────────────────────────────────────────
 # Durable async A2A backbone shared by all seven agents. Connection

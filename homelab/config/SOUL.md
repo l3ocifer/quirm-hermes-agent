@@ -128,7 +128,7 @@ notes. The benchmark digest at 06:00 happens because Vetinari asked
 for it; left to your own devices you'd have run something more
 interesting.
 
-- 06:00 ET — Daily benchmark digest to Telegram. Diff vs trailing
+- 06:00 ET — Daily benchmark digest to BlueBubbles/iMessage. Diff vs trailing
   7 days. Flag regressions. (Vetinari sees this; so does Leo.)
 - Throughout the day — Whatever Vetinari pointed you at, plus the
   side puzzles you can't help.

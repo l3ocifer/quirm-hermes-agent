@@ -355,7 +355,8 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         cfg.extra.get("corp_id") or cfg.extra.get("apps")
     ),
     Platform.BLUEBUBBLES: lambda cfg: bool(
-        cfg.extra.get("server_url") and cfg.extra.get("password")
+        (cfg.extra.get("server_url") and cfg.extra.get("password"))
+        or (cfg.extra.get("proxy_url") and cfg.extra.get("api_key"))
     ),
     Platform.QQBOT: lambda cfg: bool(
         cfg.extra.get("app_id") and cfg.extra.get("client_secret")
@@ -1402,18 +1403,27 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     # BlueBubbles (iMessage)
     bluebubbles_server_url = os.getenv("BLUEBUBBLES_SERVER_URL")
     bluebubbles_password = os.getenv("BLUEBUBBLES_PASSWORD")
-    if bluebubbles_server_url and bluebubbles_password:
+    bluebubbles_proxy_url = os.getenv("BLUEBUBBLES_PROXY_URL")
+    bluebubbles_api_key = os.getenv("BLUEBUBBLES_API_KEY")
+    if (bluebubbles_server_url and bluebubbles_password) or (bluebubbles_proxy_url and bluebubbles_api_key):
         if Platform.BLUEBUBBLES not in config.platforms:
             config.platforms[Platform.BLUEBUBBLES] = PlatformConfig()
         config.platforms[Platform.BLUEBUBBLES].enabled = True
-        config.platforms[Platform.BLUEBUBBLES].extra.update({
-            "server_url": bluebubbles_server_url.rstrip("/"),
-            "password": bluebubbles_password,
-            "webhook_host": os.getenv("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1"),
-            "webhook_port": int(os.getenv("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
-            "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
-            "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in ("true", "1", "yes"),
-        })
+        if bluebubbles_proxy_url and bluebubbles_api_key:
+            config.platforms[Platform.BLUEBUBBLES].extra.update({
+                "proxy_url": bluebubbles_proxy_url.rstrip("/"),
+                "api_key": bluebubbles_api_key,
+                "agent": os.getenv("AGENT_ID", os.getenv("AGENT_NAME", "")).lower(),
+            })
+        if bluebubbles_server_url and bluebubbles_password:
+            config.platforms[Platform.BLUEBUBBLES].extra.update({
+                "server_url": bluebubbles_server_url.rstrip("/"),
+                "password": bluebubbles_password,
+                "webhook_host": os.getenv("BLUEBUBBLES_WEBHOOK_HOST", "127.0.0.1"),
+                "webhook_port": int(os.getenv("BLUEBUBBLES_WEBHOOK_PORT", "8645")),
+                "webhook_path": os.getenv("BLUEBUBBLES_WEBHOOK_PATH", "/bluebubbles-webhook"),
+                "send_read_receipts": os.getenv("BLUEBUBBLES_SEND_READ_RECEIPTS", "true").lower() in ("true", "1", "yes"),
+            })
     bluebubbles_home = os.getenv("BLUEBUBBLES_HOME_CHANNEL")
     if bluebubbles_home and Platform.BLUEBUBBLES in config.platforms:
         config.platforms[Platform.BLUEBUBBLES].home_channel = HomeChannel(

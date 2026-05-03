@@ -59,6 +59,10 @@ spec:
             - { name: MATRIX_HOMESERVER, value: "https://conduit.leopaska.xyz" }
             - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
             - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }
+            - { name: BLUEBUBBLES_PROXY_URL, value: "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080" }
+            - name: BLUEBUBBLES_HOME_CHANNEL
+              valueFrom:
+                secretKeyRef: { name: bluebubbles-proxy-secrets, key: LEO_IMESSAGE_HANDLE }
             - { name: TZ, value: "America/New_York" }
             - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-QUIRM" }
           envFrom:

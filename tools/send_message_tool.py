@@ -1552,7 +1552,38 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
 
 
 async def _send_bluebubbles(extra, chat_id, message):
-    """Send via BlueBubbles iMessage server using the adapter's REST API."""
+    """Send via BlueBubbles iMessage server or the in-cluster proxy."""
+    proxy_url = (extra.get("proxy_url") or os.getenv("BLUEBUBBLES_PROXY_URL", "")).rstrip("/")
+    api_key = extra.get("api_key") or os.getenv("BLUEBUBBLES_API_KEY", "")
+    agent = (extra.get("agent") or os.getenv("AGENT_ID") or os.getenv("AGENT_NAME", "")).lower()
+    if proxy_url and api_key and agent:
+        try:
+            import httpx
+        except ImportError:
+            return {"error": "httpx not installed"}
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{proxy_url}/imessage/{agent}/send",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"to": chat_id, "text": message},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("status") not in {"sent", "accepted_unconfirmed"}:
+                    return _error(
+                        f"BlueBubbles proxy returned status {data.get('status')}"
+                    )
+                return {
+                    "success": True,
+                    "platform": "bluebubbles",
+                    "chat_id": chat_id,
+                    "status": data.get("status"),
+                }
+        except Exception as e:
+            return _error(f"BlueBubbles proxy send failed: {e}")
+
     try:
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
         if not check_bluebubbles_requirements():
