@@ -50,7 +50,7 @@ spec:
           env:
             - { name: AGENT_NAME, value: "Quirm" }
             - { name: AGENT_ID, value: "quirm" }
-            - { name: HERMES_CONFIG, value: "/home/hermes/.hermes/config.toml" }
+            - { name: HERMES_CONFIG, value: "/home/hermes/.hermes/config.yaml" }
             - { name: GATEWAY_HOST, value: "0.0.0.0" }
             - { name: GATEWAY_PORT, value: "3001" }
             - { name: GATEWAY_ALLOW_ALL_USERS, value: "true" }
@@ -86,6 +86,7 @@ spec:
             - { name: state,           mountPath: /home/hermes/.hermes }
             - { name: state,           mountPath: /data, subPath: hardstop }
             - { name: persona,         mountPath: /home/hermes/.hermes/workspace, readOnly: true }
+            - { name: hermes-config,   mountPath: /home/hermes/.hermes/config.yaml, subPath: config.yaml, readOnly: true }
             - { name: hermes-config,   mountPath: /home/hermes/.hermes/config.toml, subPath: config.toml, readOnly: true }
             - { name: graph-quirm,     mountPath: /data/graphs/quirm }
             - { name: graph-frick,     mountPath: /data/graphs/frick,    readOnly: true }

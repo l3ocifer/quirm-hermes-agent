@@ -1,0 +1,30 @@
+# Quirm's Hermes inference configuration. Routes through the
+# in-cluster LiteLLM proxy (inference namespace) which fronts the
+# vLLM, embedding, and rerank services running on the homelab GPUs.
+#
+# Default model is `long` (131K context window) because the persona
+# + workspace identity files alone push the system prompt above
+# Hermes' 64K minimum context-window guard.
+
+model:
+  default: long
+  provider: litellm
+  context_length: 131072
+
+providers:
+  litellm:
+    name: LiteLLM Homelab
+    base_url: http://litellm.inference.svc.cluster.local:4000/v1
+    key_env: LITELLM_API_KEY
+    api_mode: chat_completions
+    default_model: long
+    context_length: 131072
+    models:
+      chat:
+        context_length: 16384
+      long:
+        context_length: 131072
+      code:
+        context_length: 16384
+      frontier:
+        context_length: 200000

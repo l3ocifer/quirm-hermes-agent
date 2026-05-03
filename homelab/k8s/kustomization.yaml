@@ -25,6 +25,7 @@ configMapGenerator:
       - USER.md=../shared/openclaw-configs/shared/USER.md
   - name: quirm-hermes-config
     files:
+      - config.yaml=../config/hermes-config.yaml
       - config.toml=../config/hermes.toml
 
 generatorOptions:
