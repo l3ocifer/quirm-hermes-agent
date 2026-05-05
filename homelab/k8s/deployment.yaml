@@ -60,6 +60,14 @@ spec:
             - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
             - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }
             - { name: BLUEBUBBLES_PROXY_URL, value: "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080" }
+            # Hermes' BlueBubblesAdapter.connect() only reads SERVER_URL +
+            # PASSWORD; point at the in-cluster Service for the real BB
+            # server on the MacBook so Quirm can DM Leo when there's a
+            # research data point worth surfacing.
+            - { name: BLUEBUBBLES_SERVER_URL, value: "http://bluebubbles-server.agents-shared.svc.cluster.local:1234" }
+            - name: BLUEBUBBLES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: bluebubbles-proxy-secrets, key: BLUEBUBBLES_PASSWORD }
             - name: BLUEBUBBLES_HOME_CHANNEL
               valueFrom:
                 secretKeyRef: { name: bluebubbles-proxy-secrets, key: LEO_IMESSAGE_HANDLE }
