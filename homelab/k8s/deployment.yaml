@@ -56,6 +56,12 @@ spec:
             - { name: GATEWAY_ALLOW_ALL_USERS, value: "true" }
             - { name: WEBHOOK_ENABLED, value: "true" }
             - { name: WEBHOOK_PORT, value: "3001" }
+            # Hermes built-in API server. Enables /api/jobs HTTP CRUD so
+            # cron-reconcile Jobs can declaratively manage cron tasks
+            # via IaC. Cluster-only; Authelia gates the public ingress.
+            - { name: API_SERVER_ENABLED, value: "true" }
+            - { name: API_SERVER_HOST,    value: "0.0.0.0" }
+            - { name: API_SERVER_PORT,    value: "3002" }
             - { name: MATRIX_HOMESERVER, value: "https://conduit.leopaska.xyz" }
             - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
             - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }
@@ -77,6 +83,7 @@ spec:
             - secretRef: { name: quirm-secrets }
           ports:
             - { name: gateway, containerPort: 3001, protocol: TCP }
+            - { name: api,     containerPort: 3002, protocol: TCP }
             - { name: metrics, containerPort: 9100, protocol: TCP }
           livenessProbe:
             httpGet: { path: /health, port: gateway }

@@ -103,6 +103,7 @@ every_minutes = 30
 [[cron.tasks]]
 name     = "bench-pulse"
 schedule = "*/15 * * * *"
+# default model (long) — small SQL pulse, no reasoning.
 prompt   = """
 Pulse-check the benchmark loop. Run these three SQL queries against
 hermes_quirm (DATABASE_URL):
@@ -122,6 +123,7 @@ delivery = []
 [[cron.tasks]]
 name     = "bench-digest-daily"
 schedule = "0 6 * * *"
+model    = "frontier"  # daily research synthesis; reasoning quality matters
 prompt   = """
 Daily benchmark digest, Karpathy-style. Read from `bench.experiments`
 and `bench.findings` in hermes_quirm and produce a single iMessage:
@@ -146,6 +148,7 @@ delivery = ["bluebubbles"]
 [[cron.tasks]]
 name     = "bench-weekly-review"
 schedule = "0 9 * * 0"
+model    = "frontier"  # weekly methodology review; deepest reasoning required
 prompt   = """
 Weekly methodology review. Read bench.model_summary view + the past
 7 days of bench.findings. Identify:
@@ -163,6 +166,34 @@ should not deploy. If a new model alias should be added to the
 catalog, also write a proposal to quirm-graph/pages/proposals/.
 """
 delivery = ["bluebubbles"]
+
+[[cron.tasks]]
+name     = "bench-frontier-ceiling"
+schedule = "30 4 * * *"  # 04:30 — between Sancho (03:50) and the morning sweep
+model    = "frontier"
+# Karpathy-style "what's the ceiling?" pass. Once a day, queue a
+# frontier-pinned experiment for every prompt in `bench.prompts`
+# (skip ones with a fresh frontier run in the last 24h). The runner
+# CronJob picks them up. Establishes a per-prompt quality ceiling so
+# the daily digest can compare chat / long / frontier on the same
+# axis and flag regressions when a smaller model rivals frontier.
+prompt   = """
+Frontier ceiling pass. For every row in bench.prompts that does NOT
+already have a `bench.experiments` row with model='frontier' and
+status='done' AND finished_at > now() - interval '24 hours', insert:
+
+  INSERT INTO bench.experiments
+    (prompt_id, model, params, status, queued_at)
+  VALUES
+    ($1, 'frontier',
+     '{"temperature": 0.2, "max_tokens": 2048}'::jsonb,
+     'queued', now())
+  ON CONFLICT DO NOTHING;
+
+Cap at 30 inserts per run (token budget). The runner CronJob will
+execute them. Stay silent unless the insert fails.
+"""
+delivery = []
 
 # ─── Fleet event bus ─────────────────────────────────────────────────
 # Durable async A2A backbone shared by all seven agents. Connection

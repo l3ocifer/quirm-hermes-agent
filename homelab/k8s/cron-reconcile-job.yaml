@@ -1,0 +1,177 @@
+---
+# Quirm cron-reconcile Job (idempotent, ArgoCD post-sync hook).
+#
+# Reads [[cron.tasks]] from the mounted hermes.toml ConfigMap and
+# reconciles them into Hermes' jobs.json via the built-in /api/jobs
+# HTTP endpoint (enabled in deployment.yaml via API_SERVER_ENABLED on
+# port 3002). Mirror of sancho-cron-reconcile — only the env values
+# change. Reconcile rules + idempotency identical (see Sancho file).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: quirm-cron-reconcile
+  namespace: agents-shared
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+    argocd.argoproj.io/hook: Sync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 5
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: quirm-cron-reconcile
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: reconcile
+          image: python:3.12-slim
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              pip install --quiet --no-cache-dir 'httpx==0.28.*' 'tomli==2.*'
+              exec python /scripts/reconcile.py
+          env:
+            - { name: AGENT_NAME,  value: "quirm" }
+            - { name: AGENT_API,   value: "http://quirm.agents-shared.svc.cluster.local:3002" }
+            - { name: HERMES_TOML, value: "/config/config.toml" }
+            - { name: ORIGIN_TAG,  value: "iac" }
+          volumeMounts:
+            - { name: hermes-config, mountPath: /config }
+            - { name: scripts,       mountPath: /scripts }
+          resources:
+            requests: { cpu: "20m", memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "256Mi" }
+      volumes:
+        - { name: hermes-config, configMap: { name: quirm-hermes-config } }
+        - { name: scripts,       configMap: { name: quirm-cron-reconcile-script } }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: quirm-cron-reconcile-script
+  namespace: agents-shared
+data:
+  # Identical to sancho's reconcile.py. Kept in-line per repo so each
+  # agent owns its own GitOps-managed copy and can diverge later.
+  reconcile.py: |
+    """Reconcile [[cron.tasks]] from hermes.toml into Hermes /api/jobs."""
+    from __future__ import annotations
+
+    import os
+    import sys
+    import time
+    from typing import Any
+
+    import httpx
+    import tomli
+
+    AGENT_NAME = os.environ["AGENT_NAME"]
+    AGENT_API = os.environ["AGENT_API"].rstrip("/")
+    TOML_PATH = os.environ["HERMES_TOML"]
+    ORIGIN_TAG = os.environ.get("ORIGIN_TAG", "iac")
+
+    def _wait_for_api(client: httpx.Client) -> None:
+        for attempt in range(60):
+            try:
+                r = client.get(f"{AGENT_API}/api/jobs", timeout=5)
+                if r.status_code in (200, 401):
+                    return
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+            else:
+                last = f"HTTP {r.status_code}"
+            print(f"[{AGENT_NAME}] waiting for /api/jobs ({attempt + 1}/60): {last}", flush=True)
+            time.sleep(5)
+        raise SystemExit(f"[{AGENT_NAME}] /api/jobs unreachable after 5min")
+
+    def _load_desired() -> list[dict[str, Any]]:
+        with open(TOML_PATH, "rb") as fh:
+            cfg = tomli.load(fh)
+        tasks = cfg.get("cron", {}).get("tasks", [])
+        out: list[dict[str, Any]] = []
+        for raw in tasks:
+            if not raw.get("name") or not raw.get("schedule"):
+                print(f"[{AGENT_NAME}] skipping invalid task: {raw}", file=sys.stderr)
+                continue
+            out.append(
+                {
+                    "name": raw["name"],
+                    "schedule": raw["schedule"],
+                    "prompt": (raw.get("prompt") or "").strip(),
+                    "model": raw.get("model") or None,
+                    "provider": raw.get("provider") or None,
+                    "deliver": ",".join(raw.get("delivery", []) or []) or "local",
+                    "skills": raw.get("skills") or [],
+                    "origin": ORIGIN_TAG,
+                }
+            )
+        return out
+
+    def _index_existing(jobs: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        return {j["name"]: j for j in jobs if j.get("name")}
+
+    def _diff(desired: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
+        managed = ("schedule", "prompt", "model", "provider", "deliver", "skills")
+        patch: dict[str, Any] = {}
+        for key in managed:
+            new_val = desired.get(key)
+            cur_val = existing.get(key)
+            if key == "schedule":
+                cur_val = existing.get("schedule_display") or cur_val
+            if new_val != cur_val:
+                patch[key] = new_val
+        return patch
+
+    def main() -> None:
+        with httpx.Client(timeout=15) as client:
+            _wait_for_api(client)
+
+            r = client.get(f"{AGENT_API}/api/jobs")
+            r.raise_for_status()
+            existing_list = r.json() if isinstance(r.json(), list) else r.json().get("jobs", [])
+            existing = _index_existing(existing_list)
+
+            desired = _load_desired()
+            desired_names = {d["name"] for d in desired}
+
+            created = updated = skipped = 0
+            for spec in desired:
+                name = spec["name"]
+                if name in existing:
+                    patch = _diff(spec, existing[name])
+                    if not patch:
+                        skipped += 1
+                        continue
+                    job_id = existing[name]["id"]
+                    r = client.patch(f"{AGENT_API}/api/jobs/{job_id}", json=patch)
+                    r.raise_for_status()
+                    updated += 1
+                    print(f"[{AGENT_NAME}] updated {name}: {sorted(patch)}", flush=True)
+                else:
+                    r = client.post(f"{AGENT_API}/api/jobs", json=spec)
+                    r.raise_for_status()
+                    created += 1
+                    print(f"[{AGENT_NAME}] created {name}", flush=True)
+
+            removed = 0
+            for name, job in existing.items():
+                if name in desired_names:
+                    continue
+                if (job.get("origin") or "") != ORIGIN_TAG:
+                    continue
+                r = client.delete(f"{AGENT_API}/api/jobs/{job['id']}")
+                if r.status_code in (200, 204, 404):
+                    removed += 1
+                    print(f"[{AGENT_NAME}] removed {name} (no longer in toml)", flush=True)
+
+            print(
+                f"[{AGENT_NAME}] reconcile done: "
+                f"created={created} updated={updated} skipped={skipped} removed={removed}",
+                flush=True,
+            )
+
+    if __name__ == "__main__":
+        main()

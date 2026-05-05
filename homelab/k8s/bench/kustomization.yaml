@@ -18,11 +18,11 @@ resources:
   - schema-job.yaml
   - cronjobs.yaml
 
-# Override the in-yaml ConfigMap with the real script contents.
-# behavior: replace ensures we don't accumulate placeholder + real keys.
+# Generate the script ConfigMap from the canonical Python sources.
+# Single source of truth: edit homelab/scripts/bench/*.py and the
+# next ArgoCD sync (or kustomize build) picks up the new contents.
 configMapGenerator:
   - name: quirm-bench-scripts
-    behavior: replace
     files:
       - ../../scripts/bench/runner.py
       - ../../scripts/bench/proposer.py

@@ -27,4 +27,8 @@ providers:
       code:
         context_length: 16384
       frontier:
-        context_length: 200000
+        # Real input ceiling on llamacpp-blade-frontier (CPU MoE). Earlier
+        # 200_000 was aspirational and caused Hermes' compressor to send
+        # prompts that the backend rejected with context_window_exceeded
+        # 504s. Keep this in lockstep with LiteLLM's max_input_tokens.
+        context_length: 65536
