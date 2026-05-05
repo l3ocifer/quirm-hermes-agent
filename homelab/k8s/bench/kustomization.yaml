@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Quirm benchmark loop — Karpathy-style auto-research.
+#
+# Three pieces:
+#   1. schema-job.yaml   → applies the bench.* schema to hermes_quirm
+#                          via a one-shot Job (idempotent, ON_ERROR_STOP=1).
+#   2. cronjobs.yaml     → runner (every 1m) + proposer (every 30m).
+#   3. configMapGenerator below → reads the canonical runner.py /
+#                          proposer.py from homelab/scripts/bench/ so
+#                          the cronjob ConfigMap stays in sync with
+#                          the files reviewers edit.
+
+namespace: agents-shared
+
+resources:
+  - schema-job.yaml
+  - cronjobs.yaml
+
+# Override the in-yaml ConfigMap with the real script contents.
+# behavior: replace ensures we don't accumulate placeholder + real keys.
+configMapGenerator:
+  - name: quirm-bench-scripts
+    behavior: replace
+    files:
+      - ../../scripts/bench/runner.py
+      - ../../scripts/bench/proposer.py
+
+generatorOptions:
+  disableNameSuffixHash: true

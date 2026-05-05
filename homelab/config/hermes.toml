@@ -86,14 +86,82 @@ url = "https://hc-ping.com/quirm-${HEALTHCHECKS_UUID}"
 every_minutes = 30
 
 [cron]
+
+# ─── Karpathy-style auto-research loop ───────────────────────────────
+# The mechanical half of the loop runs as standalone k8s CronJobs:
+#   quirm-bench-runner    every 1m   pops one bench.experiments row,
+#                                    calls LiteLLM, writes metrics +
+#                                    auto-grader score back, emits
+#                                    findings on regression / cliff.
+#   quirm-bench-proposer  every 30m  reads coverage gaps + top-N
+#                                    candidates, queues new experiments
+#                                    (coverage, confirm, explore).
+# This Hermes cron is the *human* half — Quirm reads bench.* state,
+# narrates what happened, and decides what to escalate.
+# Tables: bench.prompts, bench.experiments, bench.findings.
+
 [[cron.tasks]]
+name     = "bench-pulse"
+schedule = "*/15 * * * *"
+prompt   = """
+Pulse-check the benchmark loop. Run these three SQL queries against
+hermes_quirm (DATABASE_URL):
+
+  SELECT count(*) AS queued FROM bench.experiments WHERE status='queued';
+  SELECT count(*) AS running FROM bench.experiments WHERE status='running'
+     AND started_at > now() - interval '10 min';
+  SELECT count(*) AS unseen_findings FROM bench.findings WHERE seen_by_user=false;
+
+If queued=0 and running=0, the loop is starved — log a one-line
+warning to journals and ping vetinari via A2A (kind=research.starved).
+If unseen_findings > 0, do nothing — the daily digest will surface
+them. Otherwise stay silent. Keep this turn under 30 seconds.
+"""
+delivery = []
+
+[[cron.tasks]]
+name     = "bench-digest-daily"
 schedule = "0 6 * * *"
-prompt   = "Run the daily benchmark digest. Compare yesterday's runs to the trailing 7-day window. Flag any P95 latency regression > 20% or cost increase > 30%. Send the user-facing summary via BlueBubbles/iMessage and to vetinari (A2A) so he has it for the morning briefing. Save the full report to quirm-graph/pages/runs/."
+prompt   = """
+Daily benchmark digest, Karpathy-style. Read from `bench.experiments`
+and `bench.findings` in hermes_quirm and produce a single iMessage:
+
+  • What ran in the last 24h  (count + which models / prompts)
+  • Best-on-pareto today      (top 3 by score per model class)
+  • Worst regressions         (any bench.findings rows where severity
+                               in 'notable','important','urgent')
+  • Open questions            (model × prompt pairs with <3 done runs
+                               that the proposer hasn't filled yet)
+
+Write the full long-form report to quirm-graph/pages/runs/YYYY-MM-DD.md.
+Send the iMessage summary to Leo (≤4 paragraphs). Send the same
+summary to vetinari via A2A (kind=research.daily-digest) so the
+morning briefing can cite it.
+
+After sending, mark the surfaced bench.findings rows as seen:
+  UPDATE bench.findings SET seen_by_user=true WHERE id = ANY($1);
+"""
 delivery = ["bluebubbles"]
 
 [[cron.tasks]]
+name     = "bench-weekly-review"
 schedule = "0 9 * * 0"
-prompt   = "Weekly methodology review. Re-run any benchmark from the past 7 days that produced surprising results. Check statistical significance. Update the eval harness if any rubric needs revision. Post a one-page memo to quirm-graph/pages/memos/. Send the user-facing summary via BlueBubbles/iMessage, and send vimes a list of any new prototypes from the past week so he can flag any that should not deploy."
+prompt   = """
+Weekly methodology review. Read bench.model_summary view + the past
+7 days of bench.findings. Identify:
+
+  1. Models that consistently land on the pareto frontier.
+  2. Prompts where every model scores <0.6 — likely a bad prompt or
+     a real capability gap. Propose a rewrite or a new prompt.
+  3. Coverage gaps that the proposer hasn't filled — figure out why
+     (model unavailable? prompt too long for window?).
+
+Write a one-page memo to quirm-graph/pages/memos/. Send the
+user-facing summary to Leo via iMessage. Send vimes a list of any
+new prototypes that produced strong results so he can flag any that
+should not deploy. If a new model alias should be added to the
+catalog, also write a proposal to quirm-graph/pages/proposals/.
+"""
 delivery = ["bluebubbles"]
 
 # ─── Fleet event bus ─────────────────────────────────────────────────

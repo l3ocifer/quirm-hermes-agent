@@ -13,6 +13,7 @@ resources:
   - service.yaml
   - ingressroute.yaml
   - deployment.yaml
+  - bench/        # Karpathy-style benchmark loop (schema job + runner + proposer)
 
 configMapGenerator:
   - name: quirm-persona
