@@ -2,17 +2,20 @@
 # in-cluster LiteLLM proxy (inference namespace) which fronts the
 # vLLM, embedding, and rerank services running on the homelab GPUs.
 #
-# Fleet default: `chat` — vllm-chat on thebeast (RTX 4090),
-# QuantTrio Qwen3.5-27B-AWQ-INT4, 20 K input ctx, ~80 tok/s.
-# `long` (262 K) and `frontier` (65 K, 480B MoE) are opt-in per-cron-task
-# in hermes.toml via `model = "long"` / `model = "frontier"`. Hermes'
-# compressor uses the active model's context_length below, so per-task
-# overrides automatically get the right window.
+# Default model: `long` — vllm-long on alef (RTX 3090),
+# Qwen3.5-9B-AWQ + DeltaNet, 262 K input ctx. Smaller-but-fast and
+# satisfies Hermes-Agent's hard ≥64 K context floor enforced in
+# run_agent.py L2020 (vllm-chat's 20 K ctx hits this and crashes the
+# agent loop).  `chat` (20 K, 27B) and `frontier` (65 K, 480B MoE)
+# remain opt-in per-cron-task in hermes.toml via `model = "chat"` /
+# `model = "frontier"`.  Hermes' compressor uses the active model's
+# context_length below, so per-task overrides automatically get the
+# right window.
 
 model:
-  default: chat
+  default: long
   provider: litellm
-  context_length: 20480
+  context_length: 262144
 
 providers:
   litellm:
@@ -20,13 +23,23 @@ providers:
     base_url: http://litellm.inference.svc.cluster.local:4000/v1
     key_env: LITELLM_API_KEY
     api_mode: chat_completions
-    default_model: chat
-    context_length: 20480
+    default_model: long
+    context_length: 262144
     models:
       chat:
-        # vllm-chat (thebeast / RTX 4090) — Qwen3.5 27B AWQ INT4.
-        # Mirrors LiteLLM `chat.model_info.max_input_tokens`.
-        context_length: 20480
+        # vllm-chat (thebeast / RTX 4090) — Qwen3.6 27B AWQ INT4.
+        # Actual served context is 20 K (LiteLLM
+        # `chat.model_info.max_input_tokens=20480`).  We DELIBERATELY
+        # lie to Hermes here and report 65 K to satisfy its hard
+        # ≥64 K floor (run_agent.py L2020) — otherwise a task that
+        # opts into `model = "chat"` via hermes.toml crashes the
+        # AIAgent init.  The 40-litellm-config.yaml fallback
+        # `chat: ["long"]` catches any prompt that actually
+        # overflows the real 20 K window and re-routes to vllm-long,
+        # so the lie is safe in practice.  Drop back to 20480 once
+        # the fleet default is on a 64 K+ model (Qwen3.6-35B-A3B on
+        # alef, in progress as of 2026-05-12).
+        context_length: 65536
       long:
         # vllm-long (alef / RTX 3090) — Qwen3.5 9B AWQ + DeltaNet.
         # Native 262 K context. Use for big synthesis / long sessions.
@@ -35,5 +48,6 @@ providers:
         # llamacpp-blade-frontier — unsloth Qwen3-Coder 480B-A35B GGUF
         # Q4_K_M on dual Xeon E5-2667 v2. CPU-only, ~3-5 tok/s. Capped
         # at 64 K ctx to keep KV in headroom; mirrors LiteLLM
-        # `frontier.model_info.max_input_tokens`.
+        # `frontier.model_info.max_input_tokens`. Already ≥64 K so no
+        # Hermes-floor lie needed.
         context_length: 65536
