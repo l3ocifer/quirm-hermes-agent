@@ -1,0 +1,23 @@
+# CODEOWNERS for quirm-hermes-agent
+#
+# Order matters: later patterns override earlier ones.
+# Lines starting with '#' are comments.
+# See https://docs.github.com/en/repositories/managing-your-repositories-settings-and-security/customizing-your-repository/about-code-owners
+
+# Default owner for everything in the repo
+*                                   @l3ocifer
+
+# CI / build / release infra
+/.github/                           @l3ocifer
+/.github/workflows/                 @l3ocifer
+/Dockerfile*                        @l3ocifer
+/docker-compose*.yml                @l3ocifer
+/Makefile                           @l3ocifer
+
+# Agent contract — changing this changes how every agent behaves
+/AGENTS.md                          @l3ocifer
+/CLAUDE.md                          @l3ocifer
+/.cursor/                           @l3ocifer
+
+# Sensitive paths (extended per-repo via SENSITIVE_PATHS in repos.yaml)
+# (no extra sensitive paths declared)

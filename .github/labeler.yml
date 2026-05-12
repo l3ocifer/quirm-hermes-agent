@@ -1,0 +1,55 @@
+# Path-based auto-labels for PRs. Used by .github/workflows/labeler.yml.
+# Extend per-repo as needed; do not remove the baseline labels.
+
+area:ci:
+  - changed-files:
+      - any-glob-to-any-file:
+          - .github/**
+          - .pre-commit-config.yaml
+
+area:docs:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+          - docs/**
+
+area:agent-contract:
+  - changed-files:
+      - any-glob-to-any-file:
+          - AGENTS.md
+          - CLAUDE.md
+          - .cursor/**
+
+area:deps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - package.json
+          - package-lock.json
+          - pnpm-lock.yaml
+          - yarn.lock
+          - Cargo.toml
+          - Cargo.lock
+          - go.mod
+          - go.sum
+          - pyproject.toml
+          - poetry.lock
+          - requirements*.txt
+
+area:infra:
+  - changed-files:
+      - any-glob-to-any-file:
+          - terraform/**
+          - infrastructure/**
+          - ansible/**
+          - argocd/**
+          - kustomize/**
+          - helm/**
+          - k8s/**
+          - kubernetes/**
+
+area:secrets-touched:
+  - changed-files:
+      - any-glob-to-any-file:
+          - secrets/**
+          - "**/*secret*"
+          - "**/*credential*"

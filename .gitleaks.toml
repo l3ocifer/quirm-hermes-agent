@@ -1,0 +1,19 @@
+# Gitleaks config baseline. Extends the default ruleset.
+# Add per-repo allowlist entries below; do not weaken the default rules.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generic allowlist for documentation and examples"
+paths = [
+  '''(?i)\.example($|/)''',
+  '''(?i)\.sample($|/)''',
+  '''(?i)/fixtures/''',
+  '''(?i)/__tests__/.*\.(snap|fixture)\.''',
+]
+regexes = [
+  '''(?i)example[_-]?(api[_-]?)?key''',
+  '''(?i)dummy[_-]?(secret|token|password)''',
+  '''(?i)changeme''',
+]
