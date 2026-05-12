@@ -81,7 +81,7 @@ data:
         for attempt in range(60):
             try:
                 r = client.get(f"{AGENT_API}/api/jobs", headers=API_HEADERS, timeout=5)
-                if r.status_code in (200, 401):
+                if r.status_code == 200:
                     return
             except Exception as exc:  # noqa: BLE001
                 last = exc
@@ -105,8 +105,6 @@ data:
                     "name": raw["name"],
                     "schedule": raw["schedule"],
                     "prompt": (raw.get("prompt") or "").strip(),
-                    "model": raw.get("model") or None,
-                    "provider": raw.get("provider") or None,
                     "deliver": ",".join(raw.get("delivery", []) or []) or "local",
                     "skills": raw.get("skills") or [],
                     "origin": ORIGIN_TAG,
@@ -118,7 +116,7 @@ data:
         return {j["name"]: j for j in jobs if j.get("name")}
 
     def _diff(desired: dict[str, Any], existing: dict[str, Any]) -> dict[str, Any]:
-        managed = ("schedule", "prompt", "model", "provider", "deliver", "skills")
+        managed = ("schedule", "prompt", "deliver", "skills")
         patch: dict[str, Any] = {}
         for key in managed:
             new_val = desired.get(key)
@@ -129,12 +127,20 @@ data:
                 patch[key] = new_val
         return patch
 
+    def _raise_for_status(response: httpx.Response, action: str) -> None:
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise RuntimeError(
+                f"{action} failed with HTTP {response.status_code}: {response.text[:500]}"
+            ) from exc
+
     def main() -> None:
         with httpx.Client(timeout=15) as client:
             _wait_for_api(client)
 
             r = client.get(f"{AGENT_API}/api/jobs", headers=API_HEADERS)
-            r.raise_for_status()
+            _raise_for_status(r, "list jobs")
             existing_list = r.json() if isinstance(r.json(), list) else r.json().get("jobs", [])
             existing = _index_existing(existing_list)
 
@@ -151,12 +157,12 @@ data:
                         continue
                     job_id = existing[name]["id"]
                     r = client.patch(f"{AGENT_API}/api/jobs/{job_id}", headers=API_HEADERS, json=patch)
-                    r.raise_for_status()
+                    _raise_for_status(r, f"update {name}")
                     updated += 1
                     print(f"[{AGENT_NAME}] updated {name}: {sorted(patch)}", flush=True)
                 else:
                     r = client.post(f"{AGENT_API}/api/jobs", headers=API_HEADERS, json=spec)
-                    r.raise_for_status()
+                    _raise_for_status(r, f"create {name}")
                     created += 1
                     print(f"[{AGENT_NAME}] created {name}", flush=True)
 
