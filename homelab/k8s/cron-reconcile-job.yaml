@@ -38,6 +38,9 @@ spec:
             - { name: AGENT_API,   value: "http://quirm.agents-shared.svc.cluster.local:3002" }
             - { name: HERMES_TOML, value: "/config/config.toml" }
             - { name: ORIGIN_TAG,  value: "iac" }
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef: { name: quirm-secrets, key: A2A_BEARER_TOKEN }
           volumeMounts:
             - { name: hermes-config, mountPath: /config }
             - { name: scripts,       mountPath: /scripts }
@@ -72,11 +75,12 @@ data:
     AGENT_API = os.environ["AGENT_API"].rstrip("/")
     TOML_PATH = os.environ["HERMES_TOML"]
     ORIGIN_TAG = os.environ.get("ORIGIN_TAG", "iac")
+    API_HEADERS = {"Authorization": f"Bearer {os.environ['API_SERVER_KEY']}"}
 
     def _wait_for_api(client: httpx.Client) -> None:
         for attempt in range(60):
             try:
-                r = client.get(f"{AGENT_API}/api/jobs", timeout=5)
+                r = client.get(f"{AGENT_API}/api/jobs", headers=API_HEADERS, timeout=5)
                 if r.status_code in (200, 401):
                     return
             except Exception as exc:  # noqa: BLE001
@@ -129,7 +133,7 @@ data:
         with httpx.Client(timeout=15) as client:
             _wait_for_api(client)
 
-            r = client.get(f"{AGENT_API}/api/jobs")
+            r = client.get(f"{AGENT_API}/api/jobs", headers=API_HEADERS)
             r.raise_for_status()
             existing_list = r.json() if isinstance(r.json(), list) else r.json().get("jobs", [])
             existing = _index_existing(existing_list)
@@ -146,12 +150,12 @@ data:
                         skipped += 1
                         continue
                     job_id = existing[name]["id"]
-                    r = client.patch(f"{AGENT_API}/api/jobs/{job_id}", json=patch)
+                    r = client.patch(f"{AGENT_API}/api/jobs/{job_id}", headers=API_HEADERS, json=patch)
                     r.raise_for_status()
                     updated += 1
                     print(f"[{AGENT_NAME}] updated {name}: {sorted(patch)}", flush=True)
                 else:
-                    r = client.post(f"{AGENT_API}/api/jobs", json=spec)
+                    r = client.post(f"{AGENT_API}/api/jobs", headers=API_HEADERS, json=spec)
                     r.raise_for_status()
                     created += 1
                     print(f"[{AGENT_NAME}] created {name}", flush=True)
@@ -162,7 +166,7 @@ data:
                     continue
                 if (job.get("origin") or "") != ORIGIN_TAG:
                     continue
-                r = client.delete(f"{AGENT_API}/api/jobs/{job['id']}")
+                r = client.delete(f"{AGENT_API}/api/jobs/{job['id']}", headers=API_HEADERS)
                 if r.status_code in (200, 204, 404):
                     removed += 1
                     print(f"[{AGENT_NAME}] removed {name} (no longer in toml)", flush=True)
