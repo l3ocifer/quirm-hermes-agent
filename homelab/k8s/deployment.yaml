@@ -62,6 +62,9 @@ spec:
             - { name: API_SERVER_ENABLED, value: "true" }
             - { name: API_SERVER_HOST,    value: "0.0.0.0" }
             - { name: API_SERVER_PORT,    value: "3002" }
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef: { name: quirm-secrets, key: A2A_BEARER_TOKEN }
             - { name: MATRIX_HOMESERVER, value: "https://conduit.leopaska.xyz" }
             - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
             - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }

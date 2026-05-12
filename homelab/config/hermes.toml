@@ -13,9 +13,15 @@ bind = "0.0.0.0:3001"
 metrics_bind = "0.0.0.0:9100"
 
 [providers.litellm]
+# Fleet default is `chat` (vllm-chat / Qwen3.5 27B AWQ on thebeast).
+# `long` and `frontier` are opt-in per [[cron.tasks]] entry via
+# `model = "long"` / `model = "frontier"`. Frontier is intentionally
+# excluded from auto-fallbacks (CPU-only, ~3-5 tok/s).
 base_url = "http://litellm.inference.svc.cluster.local:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 default_model = "chat"
+fallbacks = ["long"]
+models = ["chat", "long", "frontier", "embed", "rerank"]
 
 [memory]
 backend = "postgres"
