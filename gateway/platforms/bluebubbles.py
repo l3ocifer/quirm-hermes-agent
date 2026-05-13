@@ -340,15 +340,22 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     async def _resolve_chat_guid(self, target: str) -> Optional[str]:
         """Resolve an email/phone to a BlueBubbles chat GUID.
 
-        If *target* already contains a semicolon (raw GUID format like
-        ``iMessage;-;user@example.com``), it is returned as-is.  Otherwise
-        the adapter queries the BlueBubbles chat list and matches on
-        ``chatIdentifier`` or participant address.
+        Resolution order:
+          1. Caller-provided raw GUID (contains ``;``) → return as-is.
+          2. Cache hit on a previous resolution.
+          3. Query BB-server's chat list and match on ``chatIdentifier``
+             or any participant's ``address``.
+          4. Fall back to ``any;-;<handle>`` for phone/email handles.
+             BB-server treats this as "1-on-1 chat with this handle,
+             create if missing" (verified t3 fix on 2026-05-12). Without
+             this fallback, the legacy behavior was to return None and
+             error with "chat not found" for any handle whose chat
+             hadn't been observed yet — which is the most common case
+             for agent-initiated outbound iMessages.
         """
         target = (target or "").strip()
         if not target:
             return None
-        # Already a raw GUID
         if ";" in target:
             return target
         if target in self._guid_cache:
@@ -371,6 +378,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                         return guid
         except Exception:
             pass
+        # Fallback (t3 fix, 2026-05-12): synthesize ``any;-;<handle>``
+        # for phone or email handles. BB-server resolves this to a 1-on-1
+        # chat, creating it on the Mac if necessary. Verified working
+        # against bb-server 1.x; the legacy ``iMessage;+;<handle>`` form
+        # times out / 404s for chats that don't already exist.
+        if "@" in target or re.match(r"^\+?\d+$", target):
+            fallback = f"any;-;{target}"
+            self._guid_cache[target] = fallback
+            return fallback
         return None
 
     async def _create_chat_for_handle(
