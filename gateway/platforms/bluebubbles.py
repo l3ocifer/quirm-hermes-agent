@@ -337,7 +337,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Chat GUID resolution
     # ------------------------------------------------------------------
 
-    async def _resolve_chat_guid(self, target: str) -> Optional[str]:
+    async def _resolve_chat_guid(
+        self, target: str, *, _depth: int = 0
+    ) -> Optional[str]:
         """Resolve an email/phone to a BlueBubbles chat GUID.
 
         Resolution order:
@@ -352,6 +354,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
              error with "chat not found" for any handle whose chat
              hadn't been observed yet — which is the most common case
              for agent-initiated outbound iMessages.
+          5. Symbolic slug targets (``operator-*``, bare identifiers used by
+             cron/skills) → resolve ``BLUEBUBBLES_HOME_CHANNEL`` when set (Leo DM).
         """
         target = (target or "").strip()
         if not target:
@@ -387,6 +391,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             fallback = f"any;-;{target}"
             self._guid_cache[target] = fallback
             return fallback
+        # Cron/skills often pass slug targets that are not phone/GUID — route to
+        # the configured home DM (same env as Hermes deployments: Leo handle).
+        home = (os.environ.get("BLUEBUBBLES_HOME_CHANNEL") or "").strip()
+        if (
+            home
+            and target != home
+            and _depth < 1
+            and not (";" in target)
+        ):
+            slugish = re.match(r"^[a-zA-Z][a-zA-Z0-9_-]*$", target) is not None
+            if slugish or target.startswith("operator-"):
+                return await self._resolve_chat_guid(home, _depth=_depth + 1)
         return None
 
     async def _create_chat_for_handle(
