@@ -1,0 +1,41 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommits",
+    ":automergeMinor",
+    ":automergeDigest",
+    "schedule:weekends",
+    "group:allNonMajor",
+  ],
+  timezone: "America/New_York",
+  labels: ["area:deps", "renovate"],
+  prHourlyLimit: 4,
+  prConcurrentLimit: 8,
+  rangeStrategy: "bump",
+  rebaseWhen: "behind-base-branch",
+  packageRules: [
+    {
+      description: "Group lockfile-only updates",
+      matchUpdateTypes: ["lockFileMaintenance"],
+      groupName: "lockfile maintenance",
+      schedule: ["before 6am on monday"],
+    },
+    {
+      description: "Major updates need review",
+      matchUpdateTypes: ["major"],
+      automerge: false,
+      addLabels: ["needs:owner-review"],
+    },
+    {
+      description: "Pin GitHub Actions to digests",
+      matchManagers: ["github-actions"],
+      pinDigests: true,
+    },
+  ],
+  vulnerabilityAlerts: {
+    labels: ["security"],
+    automerge: false,
+  },
+}
