@@ -17,11 +17,21 @@ metrics_bind = "0.0.0.0:9100"
 # `long` and `frontier` are opt-in per [[cron.tasks]] entry via
 # `model = "long"` / `model = "frontier"`. Frontier is intentionally
 # excluded from auto-fallbacks (CPU-only, ~3-5 tok/s).
+#
+# `claude-sonnet-max` and `claude-opus-max` route through claude-bridge
+# (homelab argocd/apps/_inference/55-claude-bridge.yaml). Bridge gates
+# against the household 7-window quota; on throttle/refusal LiteLLM
+# falls back to chat-thebeast → frontier-blade so callers always get a
+# response. Quirm's Vaultwarden virtual key is `quirm-claude` with
+# 22% of the household weekly Claude share. Use sparingly:
+#   - bench-digest-daily   (sonnet, 1×/day)
+#   - bench-weekly-review  (opus,    1×/week)
+#   - ad-hoc research memos (sonnet, on demand)
 base_url = "http://litellm.inference.svc.cluster.local:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 default_model = "chat"
 fallbacks = ["long"]
-models = ["chat", "long", "frontier", "embed", "rerank"]
+models = ["chat", "long", "frontier", "claude-sonnet-max", "claude-opus-max", "embed", "rerank"]
 
 [memory]
 backend = "postgres"
@@ -129,7 +139,12 @@ delivery = []
 [[cron.tasks]]
 name     = "bench-digest-daily"
 schedule = "0 6 * * *"
-model    = "frontier"  # daily research synthesis; reasoning quality matters
+# Claude Sonnet via Max subscription. Daily research synthesis is the
+# single most user-visible Quirm output (lands in Leo's morning iMessage)
+# so it gets the paid model. Falls back to local `chat-thebeast` then
+# `frontier-blade` if claude-bridge is throttled. See homelab
+# argocd/apps/_inference/55-claude-bridge.yaml for quota gating.
+model    = "claude-sonnet-max"
 prompt   = """
 Daily benchmark digest, Karpathy-style. Read from `bench.experiments`
 and `bench.findings` in hermes_quirm and produce a single iMessage:
@@ -154,7 +169,12 @@ delivery = ["bluebubbles"]
 [[cron.tasks]]
 name     = "bench-weekly-review"
 schedule = "0 9 * * 0"
-model    = "frontier"  # weekly methodology review; deepest reasoning required
+# Claude Opus via Max — only weekly Quirm Opus call. The weekly
+# methodology review needs the deepest reasoning available; Opus is
+# materially better at the "why did this prompt fail across every
+# model class" pattern recognition. Falls back to local `frontier`
+# if Opus is over its 7-day cap. See bridge quota policy.
+model    = "claude-opus-max"
 prompt   = """
 Weekly methodology review. Read bench.model_summary view + the past
 7 days of bench.findings. Identify:
