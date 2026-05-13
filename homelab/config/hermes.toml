@@ -129,6 +129,11 @@ hermes_quirm (DATABASE_URL):
      AND started_at > now() - interval '10 min';
   SELECT count(*) AS unseen_findings FROM bench.findings WHERE seen_by_user=false;
 
+If you INSERT JSON into fleet/journal or similar, use PostgreSQL
+dollar-quoting (e.g. ``$$ {"queued":0} $$::jsonb``) or ``jsonb_build_object``
+— never nest ``'{"...":...}'`` inside single-quoted SQL literals or psql
+will raise ``invalid input syntax for type json``.
+
 If queued=0 and running=0, the loop is starved — log a one-line
 warning to journals and ping vetinari via A2A (kind=research.starved).
 If unseen_findings > 0, do nothing — the daily digest will surface
