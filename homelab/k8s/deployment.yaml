@@ -41,7 +41,7 @@ spec:
         fsGroup: 0
       containers:
         - name: hermes
-          image: ghcr.io/l3ocifer/quirm-hermes-agent:homelab
+          image: git.leopaska.xyz/leo/quirm-hermes-agent:homelab
           imagePullPolicy: Always
           command: ["hermes"]
           args:
@@ -138,4 +138,4 @@ spec:
         - { name: graph-puck,     persistentVolumeClaim: { claimName: puck-graph } }
         - { name: graph-leo,      persistentVolumeClaim: { claimName: leo-graph } }
       imagePullSecrets:
-        - { name: ghcr-credentials }
+        - { name: forgejo-registry-credentials }
