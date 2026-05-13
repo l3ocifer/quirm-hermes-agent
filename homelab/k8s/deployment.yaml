@@ -41,7 +41,7 @@ spec:
         fsGroup: 0
       containers:
         - name: hermes
-          image: git.leopaska.xyz/leo/quirm-hermes-agent:homelab
+          image: ghcr.io/l3ocifer/quirm-hermes-agent:homelab
           imagePullPolicy: Always
           command: ["hermes"]
           args:
@@ -69,6 +69,8 @@ spec:
             - { name: MATRIX_USER_ID, value: "@quirm:leopaska.xyz" }
             - { name: MATRIX_HOME_ROOM, value: "!homelab:leopaska.xyz" }
             - { name: BLUEBUBBLES_PROXY_URL, value: "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080" }
+            - { name: AGENT_TOOL_SERVICE_URL, value: "http://agent-tool-service.agents-shared.svc.cluster.local:8080" }
+            - { name: SEARXNG_URL, value: "http://searxng.agents-shared.svc.cluster.local:8080" }
             # Hermes' BlueBubblesAdapter.connect() only reads SERVER_URL +
             # PASSWORD; point at the in-cluster Service for the real BB
             # server on the MacBook so Quirm can DM Leo when there's a
