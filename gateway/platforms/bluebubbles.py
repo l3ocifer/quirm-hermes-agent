@@ -130,6 +130,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._helper_connected: bool = False
         self._guid_cache: Dict[str, str] = {}
 
+    def _bluebubbles_home_chat_id(self) -> Optional[str]:
+        """Leo's DM for cron and symbolic routes — config or env."""
+        hc = getattr(self.config, "home_channel", None)
+        if hc is not None and getattr(hc, "chat_id", ""):
+            cid = str(hc.chat_id).strip()
+            if cid:
+                return cid
+        raw = (os.getenv("BLUEBUBBLES_HOME_CHANNEL") or "").strip()
+        return raw or None
+
     # ------------------------------------------------------------------
     # API helpers
     # ------------------------------------------------------------------
@@ -354,8 +364,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
              error with "chat not found" for any handle whose chat
              hadn't been observed yet — which is the most common case
              for agent-initiated outbound iMessages.
-          5. Symbolic slug targets (``operator-*``, bare identifiers used by
-             cron/skills) → resolve ``BLUEBUBBLES_HOME_CHANNEL`` when set (Leo DM).
+          5. Symbolic slug targets (``operator-*``, bare identifiers, cron) →
+             resolve configured home DM (``BLUEBUBBLES_HOME_CHANNEL`` or
+             platform ``home_channel``) when set.
         """
         target = (target or "").strip()
         if not target:
@@ -391,14 +402,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             fallback = f"any;-;{target}"
             self._guid_cache[target] = fallback
             return fallback
-        # Cron/skills often pass slug targets that are not phone/GUID — route to
-        # the configured home DM (same env as Hermes deployments: Leo handle).
-        home = (os.environ.get("BLUEBUBBLES_HOME_CHANNEL") or "").strip()
+        # Cron/skills often pass slug targets that are not phone/GUID —
+        # route to home (env or platform config).
+        home = self._bluebubbles_home_chat_id()
         if (
             home
             and target != home
             and _depth < 1
-            and not (";" in target)
+            and ";" not in target
         ):
             slugish = re.match(r"^[a-zA-Z][a-zA-Z0-9_-]*$", target) is not None
             if slugish or target.startswith("operator-"):
