@@ -4,7 +4,7 @@
 
 - **Framework**: Hermes Agent (NousResearch/hermes-agent fork at
   `l3ocifer/quirm-hermes-agent`)
-- **Image**: `ghcr.io/l3ocifer/quirm-hermes-agent:latest`
+- **Image**: `ghcr.io/l3ocifer/quirm-hermes-agent:homelab`
 - **Namespace**: `agents-shared`
 - **Schedule**: floats. Soft preference for `thebeast` (more RAM —
   benchmarking + prototyping benefits from headroom).
@@ -103,6 +103,29 @@ Configured in `homelab/config/hermes.toml`. Quirm's enabled toolsets:
 Quirm does NOT have `kubectl` write tooling, BlueBubbles, Home
 Assistant, or Stripe access. Read everything; mutate nothing
 outside its own state.
+
+## Web Search
+
+Quirm has a self-hosted no-key search path:
+
+| Service | URL |
+|---|---|
+| Agent Tool Service | `http://agent-tool-service.agents-shared.svc.cluster.local:8080` |
+| SearXNG | `http://searxng.agents-shared.svc.cluster.local:8080` |
+
+Use the wrapper for normal research:
+
+```bash
+curl -s "$AGENT_TOOL_SERVICE_URL/search?q=rust+web+scraping&limit=5"
+```
+
+Then extract the best source:
+
+```bash
+curl -s -X POST "$AGENT_TOOL_SERVICE_URL/extract" \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","max_chars":12000}'
+```
 
 ## Required env vars
 
