@@ -101,13 +101,19 @@ spec:
                 id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                 kind          text NOT NULL,
                 severity      text NOT NULL DEFAULT 'info'
-                                  CHECK (severity IN ('info','notable','important','urgent')),
+                                  CHECK (severity IN ('info','warn','notable','important','urgent')),
                 summary       text NOT NULL,
                 details       jsonb,
                 experiment_id uuid REFERENCES bench.experiments(id),
                 seen_by_user  boolean NOT NULL DEFAULT false,
                 created_at    timestamptz NOT NULL DEFAULT now()
               );
+
+              ALTER TABLE bench.findings
+                DROP CONSTRAINT IF EXISTS findings_severity_check;
+              ALTER TABLE bench.findings
+                ADD CONSTRAINT findings_severity_check
+                CHECK (severity IN ('info','warn','notable','important','urgent'));
 
               CREATE INDEX IF NOT EXISTS findings_unseen_idx
                 ON bench.findings (created_at DESC)
