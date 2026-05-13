@@ -80,6 +80,15 @@ spec:
             - name: BLUEBUBBLES_HOME_CHANNEL
               valueFrom:
                 secretKeyRef: { name: bluebubbles-proxy-secrets, key: LEO_IMESSAGE_HANDLE }
+            # BlueBubbles platform webhook server (gateway/platforms/bluebubbles.py
+            # spins up its own aiohttp app independent of the main gateway).
+            # Defaults bind to 127.0.0.1:8645/bluebubbles-webhook which is
+            # NOT reachable from other pods. Override to listen on 0.0.0.0:8645
+            # at /imessage/quirm — the URL the bluebubbles-proxy POSTs to.
+            # Matches the Sancho fix in 2026-05-12 (sancho commit c1fb01886).
+            - { name: BLUEBUBBLES_WEBHOOK_HOST, value: "0.0.0.0" }
+            - { name: BLUEBUBBLES_WEBHOOK_PORT, value: "8645" }
+            - { name: BLUEBUBBLES_WEBHOOK_PATH, value: "/imessage/quirm" }
             - { name: TZ, value: "America/New_York" }
             - { name: HARDSTOP_PATH, value: "/data/HARDSTOP-QUIRM" }
           envFrom:
@@ -88,6 +97,7 @@ spec:
             - { name: gateway, containerPort: 3001, protocol: TCP }
             - { name: api,     containerPort: 3002, protocol: TCP }
             - { name: metrics, containerPort: 9100, protocol: TCP }
+            - { name: bbwh,    containerPort: 8645, protocol: TCP }
           livenessProbe:
             httpGet: { path: /health, port: gateway }
             initialDelaySeconds: 30

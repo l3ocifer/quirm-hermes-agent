@@ -14,3 +14,12 @@ spec:
     - { name: gateway, port: 3001, targetPort: gateway, protocol: TCP }
     - { name: api,     port: 3002, targetPort: api,     protocol: TCP }
     - { name: metrics, port: 9100, targetPort: metrics, protocol: TCP }
+    - name: bbwh
+      # BlueBubbles platform webhook (aiohttp app spun up by
+      # gateway/platforms/bluebubbles.py — independent of the
+      # main Hermes gateway on :3001).  The bluebubbles-proxy
+      # POSTs forwarded inbound iMessages here with the BB
+      # password as a query param.  Matches Sancho's bbwh port.
+      port: 8645
+      targetPort: bbwh
+      protocol: TCP

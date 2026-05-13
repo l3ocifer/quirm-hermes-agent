@@ -78,7 +78,7 @@ url = "http://puck.agents-shared.svc:18789"
 matrix   = { homeserver_env = "MATRIX_HOMESERVER", token_env = "MATRIX_ACCESS_TOKEN", user = "@quirm:leopaska.xyz" }
 telegram = { token_env = "TELEGRAM_BOT_TOKEN", chat_id_env = "TELEGRAM_CHAT_ID_QUIRM" }
 ntfy     = { url = "https://ntfy.leopaska.xyz/quirm", token_env = "NTFY_TOKEN" }
-bluebubbles = { base_url = "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080", api_key_env = "BLUEBUBBLES_API_KEY", webhook_path = "/imessage/inbound" }
+bluebubbles = { base_url = "http://bluebubbles-proxy.agents-shared.svc.cluster.local:8080", api_key_env = "BLUEBUBBLES_API_KEY", webhook_path = "/imessage/quirm" }
 
 [quiet_hours]
 start = "22:00"
