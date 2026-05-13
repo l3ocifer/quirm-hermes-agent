@@ -18,7 +18,7 @@ metrics_bind = "0.0.0.0:9100"
 # `model = "long"` / `model = "frontier"`. Frontier is intentionally
 # excluded from auto-fallbacks (CPU-only, ~3-5 tok/s).
 #
-# `claude-sonnet-max` and `claude-opus-max` route through claude-bridge
+# Claude Code Max aliases route through claude-bridge
 # (homelab argocd/apps/_inference/55-claude-bridge.yaml). Bridge gates
 # against the household 7-window quota; on throttle/refusal LiteLLM
 # falls back to chat-thebeast → frontier-blade so callers always get a
@@ -26,12 +26,12 @@ metrics_bind = "0.0.0.0:9100"
 # 22% of the household weekly Claude share. Use sparingly:
 #   - bench-digest-daily   (sonnet, 1×/day)
 #   - bench-weekly-review  (opus,    1×/week)
-#   - ad-hoc research memos (sonnet, on demand)
+#   - ad-hoc research memos (agent chooses Claude Code model at call time)
 base_url = "http://litellm.inference.svc.cluster.local:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 default_model = "chat"
 fallbacks = ["long"]
-models = ["chat", "long", "frontier", "claude-sonnet-max", "claude-opus-max", "embed", "rerank"]
+models = ["chat", "long", "frontier", "claude-sonnet-max", "claude-opus-max", "claude-code/*", "embed", "rerank"]
 
 [memory]
 backend = "postgres"
