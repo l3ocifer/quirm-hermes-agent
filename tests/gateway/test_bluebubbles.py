@@ -48,6 +48,30 @@ class TestBlueBubblesConfigLoading:
         assert hc is not None
         assert hc.chat_id == "user@example.com"
 
+    @pytest.mark.asyncio
+    async def test_resolve_chat_guid_symbolic_falls_back_to_home(self, monkeypatch):
+        from gateway.config import HomeChannel
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        cfg = PlatformConfig(
+            enabled=True,
+            extra={"server_url": "http://localhost:1234", "password": "secret"},
+            home_channel=HomeChannel(
+                platform=Platform.BLUEBUBBLES,
+                chat_id="user@example.com",
+                name="Leo",
+            ),
+        )
+        adapter = BlueBubblesAdapter(cfg)
+        adapter.client = object()
+
+        async def fake_post(path, payload):
+            return {"data": []}
+
+        monkeypatch.setattr(adapter, "_api_post", fake_post)
+        guid = await adapter._resolve_chat_guid("operator-finalizer")
+        assert guid == "any;-;user@example.com"
+
     def test_not_connected_without_password(self, monkeypatch):
         monkeypatch.setenv("BLUEBUBBLES_SERVER_URL", "http://localhost:1234")
         monkeypatch.delenv("BLUEBUBBLES_PASSWORD", raising=False)

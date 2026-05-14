@@ -121,14 +121,20 @@ name     = "bench-pulse"
 schedule = "*/15 * * * *"
 # default model (long) — small SQL pulse, no reasoning.
 prompt   = """
-Pulse-check the benchmark loop. Run these three SQL queries against
-hermes_quirm (DATABASE_URL):
+Pulse-check the benchmark loop. Run **only** these three read-only
+queries on database `hermes_quirm` (use DATABASE_URL / terminal tool;
+one statement at a time, no DDL or writes):
 
-  SELECT count(*) AS queued FROM bench.experiments WHERE status='queued';
-  SELECT count(*) AS running FROM bench.experiments WHERE status='running'
-     AND started_at > now() - interval '10 min';
-  SELECT count(*) AS unseen_findings FROM bench.findings WHERE seen_by_user=false;
+  SELECT count(*) AS queued FROM bench.experiments WHERE status = 'queued';
+  SELECT count(*) AS running FROM bench.experiments WHERE status = 'running'
+    AND started_at > now() - interval '10 minutes';
+  SELECT count(*) AS unseen_findings FROM bench.findings WHERE seen_by_user = false;
 
+Do not INSERT, UPDATE, DELETE, or DDL in this pulse cron (read-only SELECTs only).
+For other tasks that INSERT JSON into PostgreSQL, use dollar-quoting
+(e.g. ``$$ {"queued":0} $$::jsonb``) or ``jsonb_build_object`` — never nest
+``'{"...":...}'`` inside single-quoted SQL literals or psql will raise
+``invalid input syntax for type json``.
 If queued=0 and running=0, the loop is starved — log a one-line
 warning to journals and ping vetinari via A2A (kind=research.starved).
 If unseen_findings > 0, do nothing — the daily digest will surface
