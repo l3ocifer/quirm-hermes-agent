@@ -11,9 +11,19 @@ paths = [
   '''(?i)\.sample($|/)''',
   '''(?i)/fixtures/''',
   '''(?i)/__tests__/.*\.(snap|fixture)\.''',
+  '''(?i)/fuzz/corpus/''',
+  '''(?i)/sealed-secrets/''',
+  '''(?i)\.sealed\.ya?ml$''',
+  '''(?i)/homelab/shared/archive/''',
+  '''(?i)\.tm\.jsonl$''',
+  '''(?i)/i18n/\.i18n/''',
 ]
 regexes = [
   '''(?i)example[_-]?(api[_-]?)?key''',
   '''(?i)dummy[_-]?(secret|token|password)''',
   '''(?i)changeme''',
+  '''(?i)REDACTED''',
+  '''(?i)<your[_-].+>''',
+  '''(?i)<paste[_-].+>''',
+  '''(?i)PUT[_-]YOUR[_-]''',
 ]
