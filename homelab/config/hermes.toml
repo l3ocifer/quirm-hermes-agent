@@ -118,8 +118,13 @@ every_minutes = 30
 
 [[cron.tasks]]
 name     = "bench-pulse"
-schedule = "*/15 * * * *"
-# default model (long) — small SQL pulse, no reasoning.
+schedule = "*/30 * * * *"
+# 2026-05-15: dropped from */15 to */30. The bench loop only updates on
+# proposer (*/30) + runner (1m) cadence, so a 15min pulse mostly observed
+# unchanged state and added ~48 extra chat calls/day to the shared
+# vllm-chat lane for ~no signal. */30 stays well under the proposer
+# cadence and matches the actual rate-of-change of bench.experiments.
+# default model (chat) — small SQL pulse, no reasoning.
 prompt   = """
 Pulse-check the benchmark loop. Run **only** these three read-only
 queries on database `hermes_quirm` (use DATABASE_URL / terminal tool;
