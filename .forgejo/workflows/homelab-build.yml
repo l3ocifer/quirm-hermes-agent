@@ -1,0 +1,60 @@
+name: Forgejo - Build & push homelab image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "homelab/Dockerfile"
+      - "homelab/image/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "agent/**"
+      - "acp_adapter/**"
+      - "acp_registry/**"
+      - "gateway/**"
+      - "tools/**"
+      - ".forgejo/workflows/homelab-build.yml"
+  workflow_dispatch: {}
+
+env:
+  REGISTRY_PUBLIC: git.leopaska.xyz
+  REGISTRY_INTERNAL: forgejo-http.forgejo.svc.cluster.local:3000
+  IMAGE_NAME: leo/quirm-hermes-agent
+
+jobs:
+  build-and-push:
+    runs-on: docker
+
+    steps:
+      - name: Build image and push via skopeo
+        env:
+          # The workflow token reads the repo; package writes use the shared
+          # leo-owned PAT from Forgejo Actions secrets.
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_TOKEN: ${{ secrets.FORGEJOPACKAGES }}
+          # docker:27.5.1-cli reaches the dind sidecar via the bridge gateway.
+          DOCKER_HOST: tcp://172.17.0.1:2375
+        run: |
+          set -eu
+          # Push over the cluster-internal Forgejo URL to avoid public-registry
+          # chunked upload issues seen with Docker 27+.
+          apk add --no-cache git skopeo
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
+            "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" repo
+          short_sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+
+          docker build \
+            --tag "${REGISTRY_PUBLIC}/${IMAGE_NAME}:homelab" \
+            --tag "${REGISTRY_PUBLIC}/${IMAGE_NAME}:${short_sha}" \
+            --file repo/homelab/Dockerfile \
+            repo
+
+          for tag in homelab "${short_sha}"; do
+            archive="/tmp/${IMAGE_NAME##*/}-${tag}.tar"
+            docker save "${REGISTRY_PUBLIC}/${IMAGE_NAME}:${tag}" -o "${archive}"
+            skopeo copy --dest-tls-verify=false \
+              --dest-creds "leo:${PACKAGE_TOKEN}" \
+              "docker-archive:${archive}:${REGISTRY_PUBLIC}/${IMAGE_NAME}:${tag}" \
+              "docker://${REGISTRY_INTERNAL}/${IMAGE_NAME}:${tag}"
+            rm -f "${archive}"
+          done

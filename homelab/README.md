@@ -23,7 +23,8 @@ quirm-hermes-agent/                  ← repo root (this fork)
     ├── k8s/                          ← kustomize tree
     ├── config/                       ← SOUL.md, TOOLS.md, hermes.toml
     ├── shared/                       ← submodule → l3ocifer/homelab
-    ├── .github/workflows/
+    ├── ../.forgejo/workflows/        ← primary homelab image build
+    ├── ../.github/workflows/         ← backup CI + manual GHCR fallback
     ├── PATCHES.md, CHANGELOG.md, README.md
 ```
 
@@ -49,7 +50,7 @@ See `config/hermes.toml` for the full reference.
 git clone --recursive https://github.com/l3ocifer/quirm-hermes-agent
 cd quirm-hermes-agent
 docker build -f homelab/Dockerfile \
-  -t ghcr.io/l3ocifer/quirm-hermes-agent:dev .
+  -t git.leopaska.xyz/leo/quirm-hermes-agent:dev .
 ```
 
 ## Sync from upstream

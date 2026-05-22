@@ -1,21 +1,8 @@
-name: Build & push image
+name: GitHub fallback - Build & push GHCR image
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-    paths:
-      - "homelab/Dockerfile"
-      - "homelab/image/**"
-      - "pyproject.toml"
-      - "agent/**"
-      - "acp_adapter/**"
-      - "acp_registry/**"
-  pull_request:
-    paths:
-      - "homelab/Dockerfile"
-      - "pyproject.toml"
-      - "agent/**"
+  # Forgejo is the primary CI/image path for homelab. Keep GHCR as an
+  # emergency fallback without rebuilding on every Forgejo mirror push.
   workflow_dispatch: {}
 
 permissions:
