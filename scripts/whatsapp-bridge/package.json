@@ -8,7 +8,7 @@
     "start": "node bridge.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "WhiskeySockets/Baileys#01047debd81beb20da7b7779b08edcb06aa03770",
+    "@whiskeysockets/baileys": "WhiskeySockets/Baileys#78e7e4e2cfcb1935629173427bc3292b95f61a95",
     "express": "^4.21.0",
     "qrcode-terminal": "^0.12.0",
     "pino": "^9.0.0"
