@@ -1,6 +1,6 @@
-FROM ghcr.io/astral-sh/uv:0.11.6-python3.13-trixie@sha256:b3c543b6c4f23a5f2df22866bd7857e5d304b67a564f4feab6ac22044dde719b AS uv_source
+FROM ghcr.io/astral-sh/uv:0.11.16-python3.13-trixie@sha256:8cf4c921a02b30af0e62b00991dae04aee12b28f50e64051bcf65772d8d46383 AS uv_source
 FROM tianon/gosu:1.19-trixie@sha256:3b176695959c71e123eb390d427efc665eeb561b1540e82679c15e992006b8b9 AS gosu_source
-FROM debian:13.4
+FROM debian:13.5
 
 # Disable Python stdout buffering to ensure logs are printed immediately
 ENV PYTHONUNBUFFERED=1
