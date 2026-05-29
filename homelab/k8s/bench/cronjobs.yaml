@@ -21,9 +21,18 @@
 # slow CPU/MoE `frontier` lane (~1-2 tok/s) is not cut off mid-answer while
 # the fast vLLM lanes stay snappy.
 #
-# INVARIANT: activeDeadlineSeconds  >  BENCH_RUN_BUDGET_S + max(model timeout)
+# INVARIANT: activeDeadlineSeconds  >  max(model timeout) + BENCH_JUDGE_TIMEOUT_S
 #   else Kubernetes kills the pod mid-run and the answer truncates → graded 0.
-#   Current: 1200 > 180 + 900 = 1080  ✓  (90s headroom for pip + grading)
+#   A single run = one model call (up to 900s for frontier) + one judge call
+#   (up to 120s) + grading. Current: 1200 > 900 + 120 + ~30 pip = 1050  ✓
+#
+# ── Judge (multi-dimensional scoring) ───────────────────────────────────
+# BENCH_JUDGE_MODE controls when the pinned cross-family judge (LiteLLM
+# `judge` alias → Llama-3.1-8B on short) is called: open_ended (default) only
+# scores prompts a regex can't judge; "all" judges every run; "off" is
+# deterministic-only. The runner discards a judge answer whose returned model
+# id lacks BENCH_JUDGE_EXPECT (guards against a silent fallback onto a
+# candidate lane). Composite weights are tunable via BENCH_SCORE_WEIGHTS.
 #
 # To give a model more time: bump its entry in BENCH_MODEL_TIMEOUTS, and if
 # that pushes past the invariant, raise activeDeadlineSeconds to match.
@@ -82,6 +91,11 @@ spec:
                 # backend more room — then keep the activeDeadlineSeconds
                 # invariant above. frontier = CPU 480B MoE on blade (~1-2 tok/s).
                 - { name: BENCH_MODEL_TIMEOUTS, value: '{"frontier":900,"long":300}' }
+                # Multi-dimensional scoring: pinned cross-family LLM-as-judge.
+                - { name: BENCH_JUDGE_MODE,     value: "open_ended" }
+                - { name: BENCH_JUDGE_MODEL,    value: "judge" }
+                - { name: BENCH_JUDGE_EXPECT,   value: "llama" }
+                - { name: BENCH_JUDGE_TIMEOUT_S, value: "120" }
                 - { name: OPENAI_BASE_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }
                 - name: POD_NAME
                   valueFrom: { fieldRef: { fieldPath: metadata.name } }
