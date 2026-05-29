@@ -3,7 +3,7 @@
 File Operations Module
 
 Provides file manipulation capabilities (read, write, patch, search) that work
-across all terminal backends (local, docker, ssh, singularity, modal, daytona, vercel_sandbox).
+across all terminal backends (local, docker, ssh, singularity, modal, daytona).
 
 The key insight is that all file operations can be expressed as shell commands,
 so we wrap the terminal backend's execute() interface to provide a unified file API.
@@ -72,6 +72,46 @@ def _strip_terminal_fence_leaks(text: str) -> str:
             continue
         cleaned_lines.append(cleaned)
     return "".join(cleaned_lines)
+
+
+def _detect_line_ending(sample: str) -> Optional[str]:
+    """Return the dominant line ending in ``sample`` or None if undetermined.
+
+    Looks at the first few line breaks and picks ``\\r\\n`` if any are
+    present (Windows / DOS), otherwise ``\\n`` (Unix).  Returns ``None``
+    for empty / single-line content where we can't tell.  Used to
+    preserve the file's original line endings across write_file and
+    patch operations — without this the agent's bare-LF tool args
+    silently normalize Windows-line-ending files, and patch produces
+    mixed endings when only a substituted region changes.
+    """
+    if not sample:
+        return None
+    # Look at the first chunk — enough to tell, cheap to scan.
+    head = sample[:4096]
+    if "\r\n" in head:
+        return "\r\n"
+    if "\n" in head:
+        return "\n"
+    return None
+
+
+def _normalize_line_endings(text: str, target: str) -> str:
+    """Convert all line endings in ``text`` to ``target`` (``\\n`` or ``\\r\\n``).
+
+    Idempotent: ``_normalize_line_endings(_normalize_line_endings(x, "\\r\\n"), "\\r\\n") == _normalize_line_endings(x, "\\r\\n")``.
+    Strips lone ``\\r`` characters as well, so mixed-ending content is
+    homogenized in a single pass.
+    """
+    # First collapse to LF (handle CRLF and lone CR), then expand if target
+    # is CRLF.  Order matters: doing the replacements separately would
+    # double-convert a CRLF -> LFLF.
+    lf_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    if target == "\n":
+        return lf_normalized
+    if target == "\r\n":
+        return lf_normalized.replace("\n", "\r\n")
+    return text
 
 
 def _get_safe_write_root() -> Optional[str]:
@@ -325,6 +365,44 @@ LINTERS = {
     '.go': 'go vet {file} 2>&1',
     '.rs': 'rustfmt --check {file} 2>&1',
 }
+
+# Extensions where the per-file shell linter is structurally weaker than
+# a real LSP server AND produces phantom errors on real-world projects:
+#
+# - ``.ts``: ``tsc --noEmit FILE.ts`` ignores ``tsconfig.json`` and
+#   defaults to no-lib / ES5, so every ES2015+ stdlib reference
+#   (``Promise``, ``Map``, ``Set``, ``ReadonlySet``, ``Iterable``,
+#   ``Math.imul``, ``Number.isFinite``, etc.) reports as missing.  This
+#   floods the agent's lint field with 20K+ tokens of false positives on
+#   every edit.  No supported tsc flag fixes the single-file invocation;
+#   the canonical replacement is ``tsserver`` via LSP, which respects
+#   tsconfig and gives true diagnostics.
+#
+#   ``.tsx`` is intentionally NOT in ``LINTERS`` (and therefore not
+#   here): it has no shell linter entry, so it falls through to the
+#   ``ext not in LINTERS`` skip case unchanged.  Pre-PR behavior:
+#   ``.tsx`` was implicitly ``skipped``.  Keeping it that way means
+#   ``.tsx`` edits with LSP disabled get no per-file syntax check
+#   (same as before this PR) instead of the broken ``tsc`` invocation
+#   that ``.ts`` used to get.  When LSP is enabled, ``.tsx`` is covered
+#   by the LSP tier via ``_maybe_lsp_diagnostics`` exactly as ``.ts``.
+#
+# - ``.go``: ``go vet FILE.go`` fails outside a module / GOPATH with
+#   "cannot find package" — already partially handled by
+#   ``_LINTER_UNUSABLE_PATTERNS`` but only when the package error is the
+#   ONLY output; mixed real+phantom output still leaks through.
+#   ``gopls`` is the canonical replacement.
+#
+# - ``.rs``: ``rustfmt --check FILE.rs`` is style, not type-checking, and
+#   rejects non-Cargo project files.  ``rust-analyzer`` is the canonical
+#   replacement.
+#
+# When the LSP service is configured AND ``enabled_for(path)`` for this
+# extension's file, ``_check_lint`` skips the shell linter for these
+# extensions — the ``lsp_diagnostics`` channel carries the real signal.
+# Everything else in ``LINTERS`` (Python ``py_compile``, ``node --check``)
+# is fast, file-local, and correct, so it runs unconditionally.
+_SHELL_LINTER_LSP_REDUNDANT = frozenset({'.ts', '.go', '.rs'})
 
 
 # Patterns that indicate the linter base command exists on PATH but
@@ -659,7 +737,29 @@ class ShellFileOperations(FileOperations):
         """Escape a string for safe use in shell commands."""
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
-    
+
+    def _detect_file_line_ending(self, path: str, pre_content: Optional[str] = None) -> Optional[str]:
+        """Detect the dominant line ending of a file on disk.
+
+        If ``pre_content`` is already available (we just read the file
+        for lint/LSP purposes), inspect that — zero extra exec calls.
+        Otherwise issue a tiny ``head -c 4096`` to sample the first 4KB.
+
+        Returns ``"\\r\\n"`` for CRLF (Windows), ``"\\n"`` for LF (Unix),
+        or ``None`` if undetermined (new file, empty file, single-line
+        file with no line break in the first chunk).
+        """
+        if pre_content:
+            return _detect_line_ending(pre_content)
+        # File may not exist (new write) — `head` exits 0 with empty
+        # stdout in that case which yields None below.  Cheap probe.
+        head_cmd = f"head -c 4096 {self._escape_shell_arg(path)} 2>/dev/null"
+        head_result = self._exec(head_cmd)
+        if head_result.exit_code != 0 or not head_result.stdout:
+            return None
+        return _detect_line_ending(head_result.stdout)
+
+
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
         """Generate unified diff between old and new content."""
         old_lines = old_content.splitlines(keepends=True)
@@ -909,23 +1009,44 @@ class ShellFileOperations(FileOperations):
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
 
-        # Capture pre-write content for lint-delta computation.  Only do this
-        # when an in-process OR shell linter exists for this extension — no
-        # point paying for the read otherwise.  For in-process linters we
-        # pass the content directly; for shell linters the pre-state isn't
-        # useful (we'd have to re-write-read to lint the old version, which
-        # defeats the purpose), so we skip the capture and accept the naive
-        # "all errors" report.
+        # Capture pre-write content.  Two consumers want it:
+        #
+        #   1. The lint-delta layer (for in-process linters like ast.parse
+        #      and json.loads) needs the previous content to compute the
+        #      set of NEW lint errors introduced by this write.
+        #   2. The LSP layer needs pre/post content to build a line-shift
+        #      map — pre-existing diagnostics below the edit point shift
+        #      when lines are added/removed, and the shift map remaps
+        #      baseline diagnostics into post-edit coordinates so the
+        #      strict (range-aware) delta key matches.
+        #
+        # The set of extensions we capture pre_content for is therefore
+        # the UNION of in-process lint coverage and LSP coverage.  For
+        # extensions outside both sets (binaries, opaque formats),
+        # skipping the read keeps the hot path fast.
         ext = os.path.splitext(path)[1].lower()
         pre_content: Optional[str] = None
-        if ext in LINTERS_INPROC:
+        want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
+        if want_pre:
             # Best-effort read; failure (file missing, permission) leaves
-            # pre_content as None which makes the delta step degrade
-            # gracefully to "report all errors".
+            # pre_content as None which makes both downstream consumers
+            # degrade gracefully (lint reports all errors; LSP skips the
+            # shift map).
             read_cmd = f"cat {self._escape_shell_arg(path)} 2>/dev/null"
             read_result = self._exec(read_cmd)
             if read_result.exit_code == 0 and read_result.stdout:
                 pre_content = read_result.stdout
+
+        # ── Line-ending preservation (Roo Code pattern) ──────────────
+        # If the file existed with CRLF endings and the agent's content
+        # has bare LFs, convert to CRLF before writing.  Otherwise the
+        # write silently normalizes a Windows-line-ending file (and patch
+        # produces mixed endings when only a substituted region changes).
+        # Detect from a small head sample to avoid reading the full file
+        # for line-ending purposes alone.
+        original_ending = self._detect_file_line_ending(path, pre_content)
+        if original_ending == "\r\n":
+            content = _normalize_line_endings(content, "\r\n")
 
         # Snapshot LSP diagnostics for this file (best-effort) so the
         # post-write LSP layer can return only diagnostics introduced
@@ -966,11 +1087,15 @@ class ShellFileOperations(FileOperations):
 
         # Semantic diagnostics from the LSP layer — separate channel.
         # Only fired when the syntax tier reported clean (no point asking
-        # an LSP for a file that won't even parse).  Best-effort:
-        # ``""`` is returned for any failure path.
+        # an LSP for a file that won't even parse).  Pass pre/post
+        # content so the LSP layer can build a line-shift map and
+        # remap baseline diagnostics into post-edit coordinates.
+        # Best-effort: ``""`` is returned for any failure path.
         lsp_diagnostics: Optional[str] = None
         if lint_result.success or lint_result.skipped:
-            block = self._maybe_lsp_diagnostics(path)
+            block = self._maybe_lsp_diagnostics(
+                path, pre_content=pre_content, post_content=content
+            )
             if block:
                 lsp_diagnostics = block
 
@@ -1030,6 +1155,19 @@ class ShellFileOperations(FileOperations):
             except Exception:
                 pass
             return PatchResult(error=err_msg)
+
+        # ── Line-ending preservation ──────────────────────────────────
+        # Models nearly always send old_string/new_string with bare LF
+        # in tool args (JSON-encoded), but the file may have CRLF on
+        # disk.  After fuzzy_find_and_replace, ``new_content`` is a
+        # mixed-ending string: the substituted region is LF, surrounding
+        # text keeps the file's CRLF.  Normalize the whole thing to the
+        # file's detected line ending so the on-disk file is consistent
+        # and the unified diff below reflects the actual change.
+        file_ending = _detect_line_ending(content)
+        if file_ending:
+            new_content = _normalize_line_endings(new_content, file_ending)
+
         # Write back
         write_result = self.write_file(path, new_content)
         if write_result.error:
@@ -1154,6 +1292,19 @@ class ShellFileOperations(FileOperations):
         # Fall back to shell linter.
         if ext not in LINTERS:
             return LintResult(skipped=True, message=f"No linter for {ext} files")
+
+        # If a real LSP server is active and claims this file, skip the
+        # shell linter for extensions whose per-file shell invocation is
+        # structurally weaker / floods phantom errors.  See
+        # ``_SHELL_LINTER_LSP_REDUNDANT`` above for the rationale per ext.
+        # The LSP tier runs separately via ``_maybe_lsp_diagnostics`` and
+        # carries the real diagnostics in ``lsp_diagnostics`` on the
+        # WriteResult / PatchResult.
+        if ext in _SHELL_LINTER_LSP_REDUNDANT and self._lsp_will_handle(path):
+            return LintResult(
+                skipped=True,
+                message=f"LSP server handles {ext} — shell linter skipped",
+            )
 
         linter_cmd = LINTERS[ext]
         # Extract the base command (first word)
@@ -1295,6 +1446,63 @@ class ShellFileOperations(FileOperations):
             return False
         return isinstance(env, LocalEnvironment)
 
+    def _lsp_handles_extension(self, ext: str) -> bool:
+        """Return True iff some registered LSP server claims this extension.
+
+        Used to decide whether to capture pre-write content for the
+        line-shift map.  Capturing is cheap (one ``cat`` on the host)
+        but pointless if no LSP would ever look at the file.
+
+        Safe to call on remote backends — the registry is purely
+        in-process metadata; we still gate the actual LSP path on
+        :meth:`_lsp_local_only`.
+        """
+        if not ext:
+            return False
+        try:
+            from agent.lsp.servers import SERVERS
+        except Exception:  # noqa: BLE001
+            return False
+        ext_lower = ext.lower()
+        for srv in SERVERS:
+            if ext_lower in srv.extensions:
+                return True
+        return False
+
+    def _lsp_will_handle(self, path: str) -> bool:
+        """Return True iff the LSP service is active AND will lint this file.
+
+        Stronger than :meth:`_lsp_handles_extension` — that one only checks
+        the static server registry.  This one additionally requires the
+        LSP service to be configured/enabled and the file to pass
+        :meth:`agent.lsp.manager.LSPService.enabled_for` (which gates on
+        workspace detection, disabled-server set, and the broken-pair
+        short-circuit).
+
+        Used by :meth:`_check_lint` to decide whether to skip the per-file
+        shell linter for extensions in ``_SHELL_LINTER_LSP_REDUNDANT``.
+
+        Best-effort: any failure path returns False so the shell linter
+        runs as before — never suppress lint based on an LSP probe that
+        couldn't actually answer the question.
+        """
+        if not self._lsp_local_only():
+            return False
+        try:
+            from agent.lsp import get_service
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            svc = get_service()
+        except Exception:  # noqa: BLE001
+            return False
+        if svc is None:
+            return False
+        try:
+            return bool(svc.enabled_for(path))
+        except Exception:  # noqa: BLE001
+            return False
+
     def _snapshot_lsp_baseline(self, path: str) -> None:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct.
 
@@ -1318,11 +1526,24 @@ class ShellFileOperations(FileOperations):
         except Exception:  # noqa: BLE001
             pass
 
-    def _maybe_lsp_diagnostics(self, path: str) -> str:
+    def _maybe_lsp_diagnostics(
+        self,
+        path: str,
+        *,
+        pre_content: Optional[str] = None,
+        post_content: Optional[str] = None,
+    ) -> str:
         """Best-effort LSP semantic diagnostics for ``path``.
 
         Returns a formatted ``<diagnostics>`` block, or empty string
         when LSP is unavailable / disabled / produced no errors.
+
+        When both ``pre_content`` and ``post_content`` are provided,
+        a line-shift map is built and passed to the LSPService so
+        baseline diagnostics are remapped into post-edit coordinates
+        before the set-difference.  Without this, edits that delete
+        or insert lines surface every pre-existing diagnostic below
+        the edit point as "introduced by this edit".
 
         Wraps everything in a try/except so a misbehaving LSP server
         can't break a write.  This intentionally swallows all errors
@@ -1344,8 +1565,20 @@ class ShellFileOperations(FileOperations):
             return ""
         if svc is None or not svc.enabled_for(path):
             return ""
+
+        # Build a line-shift map when we have both pre and post — it
+        # remaps baseline diagnostics into post-edit coordinates so
+        # the strict (range-aware) delta key matches correctly.
+        line_shift = None
+        if pre_content is not None and post_content is not None and pre_content != post_content:
+            try:
+                from agent.lsp.range_shift import build_line_shift
+                line_shift = build_line_shift(pre_content, post_content)
+            except Exception:  # noqa: BLE001
+                line_shift = None
+
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True)
+            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
         except Exception:  # noqa: BLE001
             return ""
         if not diagnostics:

@@ -42,6 +42,10 @@ class TestNvidiaProfile:
         p = get_provider_profile("nvidia")
         assert "nvidia.com" in p.base_url
 
+    def test_billing_header_not_profile_wide(self):
+        p = get_provider_profile("nvidia")
+        assert p.default_headers == {}
+
 
 class TestKimiProfile:
     def test_temperature_omit(self):
@@ -93,6 +97,11 @@ class TestOpenRouterProfile:
         p = get_provider_profile("openrouter")
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
         assert body["provider"] == {"allow": ["anthropic"]}
+
+    def test_extra_body_session_id(self):
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(session_id="test-session-123")
+        assert body["session_id"] == "test-session-123"
 
     def test_extra_body_no_prefs(self):
         p = get_provider_profile("openrouter")

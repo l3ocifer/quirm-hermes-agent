@@ -131,10 +131,10 @@ class TestDefaultContextLengths:
         for key, value in DEFAULT_CONTEXT_LENGTHS.items():
             if "claude" not in key:
                 continue
-            # Claude 4.6+ models (4.6 and 4.7) have 1M context at standard
+            # Claude 4.6+ models (4.6, 4.7, 4.8) have 1M context at standard
             # API pricing (no long-context premium).  Older Claude 4.x and
             # 3.x models cap at 200k.
-            if any(tag in key for tag in ("4.6", "4-6", "4.7", "4-7")):
+            if any(tag in key for tag in ("4.6", "4-6", "4.7", "4-7", "4.8", "4-8")):
                 assert value == 1000000, f"{key} should be 1000000"
             else:
                 assert value == 200000, f"{key} should be 200000"
@@ -161,9 +161,9 @@ class TestDefaultContextLengths:
         # Values sourced from models.dev (2026-04).
         expected = {
             "grok-4.20": 2000000,
-            "grok-4-1-fast": 2000000,
             "grok-4-fast": 2000000,
             "grok-4": 256000,
+            "grok-build": 256000,
             "grok-code-fast": 256000,
             "grok-3": 131072,
             "grok-2": 131072,
@@ -189,12 +189,11 @@ class TestDefaultContextLengths:
                 ("grok-4.20-0309-reasoning", 2000000),
                 ("grok-4.20-0309-non-reasoning", 2000000),
                 ("grok-4.20-multi-agent-0309", 2000000),
-                ("grok-4-1-fast-reasoning", 2000000),
-                ("grok-4-1-fast-non-reasoning", 2000000),
                 ("grok-4-fast-reasoning", 2000000),
                 ("grok-4-fast-non-reasoning", 2000000),
                 ("grok-4", 256000),
                 ("grok-4-0709", 256000),
+                ("grok-build-0.1", 256000),
                 ("grok-code-fast-1", 256000),
                 ("grok-3", 131072),
                 ("grok-3-mini", 131072),
@@ -209,6 +208,32 @@ class TestDefaultContextLengths:
                 assert actual == expected_ctx, (
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
+
+    def test_xai_oauth_grok_build_uses_xai_models_dev_context(self):
+        """xAI OAuth should share the xAI provider metadata path.
+
+        The xAI /v1/models endpoint does not currently include context fields
+        for grok-build-0.1, so this guards against falling through to the
+        generic "grok" 131k fallback when using OAuth credentials.
+        """
+        registry = {
+            "xai": {
+                "models": {
+                    "grok-build-0.1": {
+                        "limit": {"context": 256000, "output": 64000},
+                    },
+                },
+            },
+        }
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.fetch_models_dev", return_value=registry):
+            assert get_model_context_length(
+                "grok-build-0.1",
+                provider="xai-oauth",
+                base_url="https://api.x.ai/v1",
+                api_key="oauth-token",
+            ) == 256000
 
     def test_deepseek_v4_models_1m_context(self):
         from agent.model_metadata import get_model_context_length
@@ -745,6 +770,16 @@ class TestGetModelContextLength:
         """qwen3-coder has a 256K context window, not the generic 128K Qwen default."""
         mock_fetch.return_value = {}
         assert get_model_context_length("qwen3-coder") == 262144
+
+    @patch("agent.model_metadata.fetch_model_metadata")
+    def test_qwen3_6_plus_context_length(self, mock_fetch):
+        """qwen3.6-plus has a 1M context window, not the generic 128K Qwen default."""
+        mock_fetch.return_value = {}
+        assert get_model_context_length("qwen3.6-plus") == 1048576
+        # Provider-prefixed variants must resolve to the same explicit entry
+        # via the longest-substring fallback (no portal/OR cache available).
+        assert get_model_context_length("qwen/qwen3.6-plus") == 1048576
+        assert get_model_context_length("dashscope/qwen3.6-plus") == 1048576
 
     @patch("agent.model_metadata.fetch_model_metadata")
     def test_qwen_generic_context_length(self, mock_fetch):
