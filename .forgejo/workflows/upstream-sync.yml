@@ -1,0 +1,107 @@
+# upstream-sync — keep a customized fork current with its creator's upstream.
+#
+# FORK REPOS ONLY. Runs in-cluster (where the language toolchain lives), merges
+# the upstream default branch into a sync branch using the house rule
+# "prefer upstream unless it breaks local hosting" (hosting overlays kept ours),
+# pushes the branch, and opens a PR. The repo's normal build/test CI runs on
+# that PR, so a merge into the default branch is gated on a GREEN build — an
+# unbuildable upstream merge can never reach the running agent.
+#
+# Configure per-repo Actions variables:
+#   vars.UPSTREAM_URL      e.g. https://github.com/nearai/ironclaw.git   (required)
+#   vars.UPSTREAM_BRANCH   upstream branch to track (default: the upstream HEAD)
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: '17 9 * * 1'   # Mondays 09:17 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: [docker, ubuntu-22.04]
+    if: ${{ vars.UPSTREAM_URL != '' }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "forgejo-actions"
+          git config user.email "actions@git.leopaska.xyz"
+
+      - name: Merge upstream (prefer upstream; keep hosting overlays)
+        id: merge
+        run: |
+          set -uo pipefail
+          UB="${{ vars.UPSTREAM_BRANCH }}"
+          git remote add upstream "${{ vars.UPSTREAM_URL }}"
+          git fetch upstream --prune
+          [ -z "$UB" ] && UB="$(git remote show upstream | sed -n 's/.*HEAD branch: //p')"
+          [ -z "$UB" ] && UB=main
+          echo "upstream_branch=$UB" >> "$GITHUB_OUTPUT"
+
+          BASE="$(git rev-parse --abbrev-ref HEAD)"
+          echo "base_branch=$BASE" >> "$GITHUB_OUTPUT"
+          BR="sync/upstream-$(date +%Y%m%d)"
+          echo "sync_branch=$BR" >> "$GITHUB_OUTPUT"
+
+          behind=$(git rev-list --count "HEAD..upstream/$UB")
+          if [ "$behind" = "0" ]; then echo "nothing to do — already current"; echo "changed=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+
+          git checkout -B "$BR"
+
+          preserve_ours() {
+            case "$1" in
+              .forgejo/*|.github/workflows/secret-scan.yml|.github/workflows/labeler.yml|.github/labeler.yml|\
+              .github/CODEOWNERS|CODEOWNERS|.pre-commit-config.yaml|.gitleaks.toml|.editorconfig|\
+              .github/pull_request_template.md|.github/renovate.json5|.gitmodules|AGENTS.md|CLAUDE.md|\
+              homelab/*|k8s/*|deploy/*|kustomize/*|manifests/*|.argocd/*|argocd/*) return 0;;
+            esac
+            return 1
+          }
+
+          git merge --no-edit "upstream/$UB" || true
+          while IFS= read -r line; do
+            xy="${line:0:2}"; f="${line:3}"; f="${f%\"}"; f="${f#\"}"
+            case "$xy" in
+              *U*|AA|DD)
+                if preserve_ours "$f"; then
+                  if git cat-file -e ":2:$f" 2>/dev/null; then git checkout --ours -- "$f"; git add -- "$f"; else git rm -f -- "$f" >/dev/null 2>&1; fi
+                else
+                  if git cat-file -e ":3:$f" 2>/dev/null; then git checkout --theirs -- "$f"; git add -- "$f"; else git rm -f -- "$f" >/dev/null 2>&1; fi
+                fi
+                ;;
+            esac
+          done < <(git status --porcelain)
+
+          left=$(git diff --name-only --diff-filter=U | wc -l | tr -d ' ')
+          [ "$left" != "0" ] && { echo "unresolved paths remain: $left"; git diff --name-only --diff-filter=U; exit 1; }
+
+          git commit --no-edit -m "merge: sync upstream/$UB ($(date +%Y-%m-%d)) — prefer upstream, keep hosting overlays" || true
+          git push -f origin "$BR"
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+
+      - name: Open / update PR
+        if: ${{ steps.merge.outputs.changed == '1' }}
+        env:
+          TOKEN: ${{ github.token }}
+          API: ${{ github.server_url }}/api/v1
+          REPO: ${{ github.repository }}
+          HEAD: ${{ steps.merge.outputs.sync_branch }}
+          BASE: ${{ steps.merge.outputs.base_branch }}
+          UB: ${{ steps.merge.outputs.upstream_branch }}
+        run: |
+          set -e
+          body="Automated upstream sync of \`upstream/$UB\` using the house rule **prefer upstream unless it breaks local hosting** (homelab/CI/CODEOWNERS overlays kept ours).\n\nThis PR must pass the repo's normal build/test CI before it can merge — that is the build gate that protects the running agent."
+          code=$(curl -sk -o /tmp/pr.json -w '%{http_code}' -X POST "$API/repos/$REPO/pulls" \
+            -H "Authorization: token $TOKEN" -H 'Content-Type: application/json' \
+            -d "$(jq -nc --arg h "$HEAD" --arg b "$BASE" --arg t "chore: sync upstream ($UB)" --arg body "$body" \
+                  '{head:$h, base:$b, title:$t, body:$body}')")
+          if [ "$code" = "201" ]; then echo "opened PR"; elif echo "$code" | grep -q '^4'; then echo "PR likely exists (HTTP $code): $(cat /tmp/pr.json)"; else echo "PR create HTTP $code"; cat /tmp/pr.json; fi
