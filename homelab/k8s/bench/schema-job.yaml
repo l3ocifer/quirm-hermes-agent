@@ -97,6 +97,28 @@ spec:
                 ON bench.experiments (model, prompt_id, finished_at DESC)
                 WHERE status = 'done';
 
+              -- ── Phase 1: multi-dimensional scoring (additive, backward-safe) ──
+              -- grader_score stays the deterministic correctness check (the
+              -- `correctness` axis). The judge and the blended composite live in
+              -- new columns so old dashboards keep working untouched.
+              --   scores         per-axis [0,1] map, e.g.
+              --                  {"correctness":1,"format":1,"quality":0.85,
+              --                   "latency":0.7,"cost":0.9}
+              --   composite_score Σ wᵢ·axisᵢ — what the proposer optimises against.
+              --   judge_score     the judge's overall quality score [0,1].
+              --   judge_model     PINNED judge identity (calibration/drift tracking).
+              --   judge_rationale the judge's stored reasoning (promoted to findings).
+              ALTER TABLE bench.experiments
+                ADD COLUMN IF NOT EXISTS scores          jsonb,
+                ADD COLUMN IF NOT EXISTS composite_score real,
+                ADD COLUMN IF NOT EXISTS judge_score     real,
+                ADD COLUMN IF NOT EXISTS judge_model     text,
+                ADD COLUMN IF NOT EXISTS judge_rationale text;
+
+              CREATE INDEX IF NOT EXISTS experiments_done_model_composite_idx
+                ON bench.experiments (model, prompt_id, composite_score DESC)
+                WHERE status = 'done';
+
               CREATE TABLE IF NOT EXISTS bench.findings (
                 id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
                 kind          text NOT NULL,
@@ -188,10 +210,13 @@ spec:
                 SET grader_kind = EXCLUDED.grader_kind,
                     grader_spec = EXCLUDED.grader_spec;
 
-              -- Convenience views for the daily digest.
+              -- Convenience views for the daily digest. COALESCE keeps rows
+              -- graded before Phase 1 (composite_score IS NULL) visible by
+              -- falling back to the deterministic grader_score.
               CREATE OR REPLACE VIEW bench.recent_done AS
-                SELECT model, prompt_id, grader_score, wall_ms, ttft_ms,
-                       output_tokens, finished_at, result_metrics
+                SELECT model, prompt_id, grader_score, judge_score,
+                       composite_score, scores, judge_model, judge_rationale,
+                       wall_ms, ttft_ms, output_tokens, finished_at, result_metrics
                 FROM bench.experiments
                 WHERE status = 'done'
                   AND finished_at > now() - interval '7 days';
@@ -200,6 +225,8 @@ spec:
                 SELECT model,
                        count(*)               AS runs,
                        avg(grader_score)      AS avg_score,
+                       avg(judge_score)       AS avg_judge_score,
+                       avg(COALESCE(composite_score, grader_score)) AS avg_composite,
                        avg(wall_ms)::int      AS avg_wall_ms,
                        percentile_cont(0.5)  WITHIN GROUP (ORDER BY wall_ms)::int AS p50_wall_ms,
                        percentile_cont(0.95) WITHIN GROUP (ORDER BY wall_ms)::int AS p95_wall_ms,
