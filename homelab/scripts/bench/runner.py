@@ -22,6 +22,11 @@ experiment one at a time so we never hammer LiteLLM.
 Designed to run as a Kubernetes CronJob every minute. If the queue
 is empty it exits 0 immediately. If a run is in flight on a sibling
 pod, the FOR UPDATE SKIP LOCKED clause guarantees we don't double-run.
+
+Timeouts are per-model and deliberately generous — see MODEL_TIMEOUTS
+below for how to tune them. This is an unattended loop with no deadline
+pressure, so we always prefer a slow complete answer over a fast
+truncated one.
 """
 
 from __future__ import annotations
@@ -45,7 +50,41 @@ LITELLM_KEY = os.environ["LITELLM_API_KEY"]
 DATABASE_URL = os.environ["DATABASE_URL"]
 POD_NAME = os.environ.get("POD_NAME") or socket.gethostname()
 RUN_BUDGET_S = int(os.environ.get("BENCH_RUN_BUDGET_S", "180"))
-HTTP_TIMEOUT_S = int(os.environ.get("BENCH_HTTP_TIMEOUT_S", "120"))
+HTTP_TIMEOUT_S = int(os.environ.get("BENCH_HTTP_TIMEOUT_S", "180"))
+
+# ── Per-model HTTP timeout overrides (seconds) ───────────────────────────
+# This is an unattended agent research loop: we are never in a rush and we
+# care about *complete, gradable* answers, not speed. Slow CPU/MoE backends
+# (notably `frontier` = Qwen3-Coder-480B on llama.cpp/blade, ~1-2 tok/s)
+# need a far more generous ceiling than the fast vLLM lanes — otherwise the
+# response is cut off mid-generation and the grader scores a
+# truncated-but-correct answer 0, which poisons the model ranking.
+#
+# HOW TO TUNE (no code change needed — edit the runner CronJob):
+#   • Set BENCH_MODEL_TIMEOUTS to a JSON object, e.g.
+#       {"frontier": 1200, "long": 300, "code": 240}
+#     It is merged over the defaults below, so you only list overrides.
+#   • Any model not listed falls back to BENCH_HTTP_TIMEOUT_S.
+#   • CRITICAL: keep the job's activeDeadlineSeconds (cronjobs.yaml) greater
+#     than BENCH_RUN_BUDGET_S + the largest per-model timeout, or Kubernetes
+#     kills the pod mid-run and you are back to truncation.
+#   • If a run finishes with finish_reason == "length" it hit max_tokens,
+#     not the clock — raise the prompt's max_tokens, not the timeout.
+DEFAULT_MODEL_TIMEOUTS: dict[str, int] = {"frontier": 900, "long": 300}
+try:
+    MODEL_TIMEOUTS = {
+        **DEFAULT_MODEL_TIMEOUTS,
+        **{k: int(v) for k, v in json.loads(
+            os.environ.get("BENCH_MODEL_TIMEOUTS", "{}")
+        ).items()},
+    }
+except (ValueError, TypeError):
+    MODEL_TIMEOUTS = dict(DEFAULT_MODEL_TIMEOUTS)
+
+
+def model_timeout(model: str) -> int:
+    """Per-model HTTP read timeout; falls back to the global default."""
+    return int(MODEL_TIMEOUTS.get(model, HTTP_TIMEOUT_S))
 
 
 def claim_one(conn: psycopg.Connection) -> dict[str, Any] | None:
@@ -110,7 +149,7 @@ def call_model(
             body[k] = params[k]
 
     t0 = time.perf_counter()
-    with httpx.Client(timeout=HTTP_TIMEOUT_S) as client:
+    with httpx.Client(timeout=model_timeout(model)) as client:
         resp = client.post(
             f"{LITELLM_BASE}/chat/completions",
             headers={
@@ -303,7 +342,8 @@ def main() -> int:
                 break
 
             print(
-                f"[{exp['id']}] model={exp['model']} prompt={exp['prompt_id']} priority={exp['priority']}",
+                f"[{exp['id']}] model={exp['model']} prompt={exp['prompt_id']} "
+                f"priority={exp['priority']} timeout={model_timeout(exp['model'])}s",
                 flush=True,
             )
             try:
