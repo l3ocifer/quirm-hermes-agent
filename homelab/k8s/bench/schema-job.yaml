@@ -37,6 +37,13 @@ spec:
         app.kubernetes.io/name: quirm-bench-schema
     spec:
       restartPolicy: OnFailure
+      # Pin to amd64: the arm64 Pis (top/bottom/hailo) have flaky DNS and
+      # routinely fail to resolve registry-1.docker.io, which leaves this
+      # Sync hook stuck in ImagePullBackOff and wedges the whole quirm sync
+      # (e.g. corrected grader regex never lands). amd64 nodes: alef,
+      # thebeast, blade — all with reliable wired networking.
+      nodeSelector:
+        kubernetes.io/arch: amd64
       containers:
         - name: psql
           image: postgres:17

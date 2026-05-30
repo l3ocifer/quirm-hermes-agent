@@ -77,6 +77,12 @@ spec:
             app.kubernetes.io/component: runner
         spec:
           restartPolicy: Never
+          # Pin to amd64: these jobs pip-install at startup and call the
+          # in-cluster LiteLLM/judge. The arm64 Pis (top/bottom/hailo) have
+          # flaky DNS and intermittently fail image pulls / pip resolves,
+          # which silently zeroes runs. amd64 nodes: alef, thebeast, blade.
+          nodeSelector:
+            kubernetes.io/arch: amd64
           containers:
             - name: runner
               image: python:3.12-slim
@@ -150,6 +156,9 @@ spec:
             app.kubernetes.io/component: proposer
         spec:
           restartPolicy: Never
+          # Pin to amd64 — see runner rationale above (Pi DNS flakiness).
+          nodeSelector:
+            kubernetes.io/arch: amd64
           containers:
             - name: proposer
               image: python:3.12-slim
