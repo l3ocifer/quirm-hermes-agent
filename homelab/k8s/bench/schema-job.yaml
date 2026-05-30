@@ -224,7 +224,11 @@ spec:
               -- Convenience views for the daily digest. COALESCE keeps rows
               -- graded before Phase 1 (composite_score IS NULL) visible by
               -- falling back to the deterministic grader_score.
-              CREATE OR REPLACE VIEW bench.recent_done AS
+              -- DROP first: CREATE OR REPLACE cannot reorder/insert columns, so
+              -- adding the Phase-1 columns mid-list breaks on existing clusters
+              -- ("cannot change name of view column").
+              DROP VIEW IF EXISTS bench.recent_done;
+              CREATE VIEW bench.recent_done AS
                 SELECT model, prompt_id, grader_score, judge_score,
                        composite_score, scores, judge_model, judge_rationale,
                        wall_ms, ttft_ms, output_tokens, finished_at, result_metrics
@@ -232,7 +236,8 @@ spec:
                 WHERE status = 'done'
                   AND finished_at > now() - interval '7 days';
 
-              CREATE OR REPLACE VIEW bench.model_summary AS
+              DROP VIEW IF EXISTS bench.model_summary;
+              CREATE VIEW bench.model_summary AS
                 SELECT model,
                        count(*)               AS runs,
                        avg(grader_score)      AS avg_score,
