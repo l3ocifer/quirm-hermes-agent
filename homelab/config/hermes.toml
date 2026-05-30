@@ -126,13 +126,15 @@ schedule = "*/30 * * * *"
 # cadence and matches the actual rate-of-change of bench.experiments.
 # default model (chat) — small SQL pulse, no reasoning.
 prompt   = """
-Pulse-check the benchmark loop. Run **only** these three read-only
-queries on database `hermes_quirm` (use DATABASE_URL / terminal tool;
-one statement at a time, no DDL or writes):
+Pulse-check the benchmark loop. Run **only** these read-only queries on
+database `hermes_quirm` (use DATABASE_URL / terminal tool; one statement
+at a time, no DDL or writes):
 
   SELECT count(*) AS queued FROM bench.experiments WHERE status = 'queued';
   SELECT count(*) AS running FROM bench.experiments WHERE status = 'running'
     AND started_at > now() - interval '10 minutes';
+  SELECT count(*) AS done_60m FROM bench.experiments WHERE status = 'done'
+    AND finished_at > now() - interval '60 minutes';
   SELECT count(*) AS unseen_findings FROM bench.findings WHERE seen_by_user = false;
 
 Do not INSERT, UPDATE, DELETE, or DDL in this pulse cron (read-only SELECTs only).
@@ -140,10 +142,23 @@ For other tasks that INSERT JSON into PostgreSQL, use dollar-quoting
 (e.g. ``$$ {"queued":0} $$::jsonb``) or ``jsonb_build_object`` — never nest
 ``'{"...":...}'`` inside single-quoted SQL literals or psql will raise
 ``invalid input syntax for type json``.
-If queued=0 and running=0, the loop is starved — log a one-line
-warning to journals and ping vetinari via A2A (kind=research.starved).
-If unseen_findings > 0, do nothing — the daily digest will surface
-them. Otherwise stay silent. Keep this turn under 30 seconds.
+
+STARVATION RULE — judge by *runner throughput*, not instantaneous queue
+depth. An empty queue is the NORMAL caught-up state: the proposer
+(every 30m) enqueues 0 experiments when there is no coverage gap, and
+the runner (every 1m) drains the queue to 0 between proposer batches.
+Treating queued=0 as "starved" pages vetinari dozens of times a day for
+a healthy loop. The loop is genuinely starved ONLY when the runner has
+completed nothing for an hour AND nothing is in flight:
+
+  starved := (done_60m = 0) AND (queued = 0) AND (running = 0)
+
+If starved: log a one-line warning to journals and ping vetinari via A2A
+(kind=research.starved) with payload {queued, running, done_60m,
+unseen_findings}. Otherwise (queue empty but done_60m>0, or work is
+queued/running) the loop is healthy or merely caught up — stay silent.
+If unseen_findings > 0, do nothing — the daily digest surfaces them.
+Keep this turn under 30 seconds.
 """
 delivery = []
 
