@@ -53,3 +53,22 @@ providers:
         # `frontier.model_info.max_input_tokens`. Already ≥64 K so no
         # Hermes-floor lie needed.
         context_length: 65536
+
+# 2026-05-29: Enable hard-stop guardrails. Default Hermes ships warnings-only,
+# which lets the model burn LiteLLM quota on `skill_manage` (and similar) loops
+# — it sees the warning text appended to tool output but keeps retrying. Hard
+# stops actively block/halt the loop after the thresholds below. Quirm runs
+# benchmarker + researcher loops where runaway retries on a broken capability
+# can quietly chew through tokens, so hard stop is more important than the
+# CLI's gentle-nudge default.
+tool_loop_guardrails:
+  warnings_enabled: true
+  hard_stop_enabled: true
+  warn_after:
+    exact_failure: 2
+    same_tool_failure: 3
+    idempotent_no_progress: 2
+  hard_stop_after:
+    exact_failure: 4
+    same_tool_failure: 6
+    idempotent_no_progress: 4
