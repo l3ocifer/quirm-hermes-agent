@@ -1,6 +1,9 @@
 # Quirm eval architecture — multi-dimensional scoring with a dedicated judge
 
-Status: **in rollout** (Phase 1 schema landed; judge lane being stood up).
+Status: **live** — Phases 1 & 2 deployed and verified end-to-end (composite +
+judge scores landing with the correct backend `judge_model` and rationales;
+deterministic grader regex corrected so right answers no longer score 0).
+Phases 3, 4, 8 pending.
 Owner: Quirm (Hermes agent). Consumed by the bench proposer/runner/analyzer loop.
 
 This is the design for moving Quirm's auto-research loop off **binary pass/fail
@@ -101,15 +104,31 @@ testbed (lower value than the judge the whole loop depends on).
 ```
 short:8081  mlx_lm.server (Llama-3.1-8B-Instruct-4bit)   LaunchDaemon com.homelab.mlx-judge
    │
-   └── Service+Endpoints  mac-short-judge.inference.svc.cluster.local:8081   (17-mac-short-judge.yaml)
+   └── Service+Endpoints  mac-short-judge.inference.svc.cluster.local:8081   (18-mac-short-judge.yaml)
          │
-         └── LiteLLM model group `judge-mac-short` → alias `judge`  (pinned, temperature 0.2, drop_params)
-               │
-               └── runner.py judge grader → judge_score + judge_rationale
+         ├── runner.py judge grader (PRIMARY)  →  judge_score + judge_rationale
+         │     calls the Service DIRECTLY (BENCH_JUDGE_BASE), NOT via LiteLLM
+         │
+         └── LiteLLM model group `judge-mac-short` → alias `judge`  (manual/ad-hoc use only;
+               pinned, temperature 0.2, drop_params)
 ```
 
-The judge is exposed **only** via the explicit `judge` alias — no public alias,
-no fallback ladder targets it (a one-way leaf, like `mac`).
+**Why the runner bypasses the LiteLLM router for judging.** If the judge call
+went through LiteLLM, a judge outage could be silently rerouted by a fallback
+ladder onto a *candidate* lane — the model judging its own family, the exact
+self-preference bias we are trying to eliminate, and invisibly. Worse, LiteLLM
+returns the *alias* (`model=judge`) not the backend id, so the integrity guard
+couldn't tell who actually answered. So the runner calls the Mac Service
+directly at `BENCH_JUDGE_BASE` and asserts the returned model id contains
+`BENCH_JUDGE_EXPECT` (`llama`); anything else is discarded and the run is left
+judge-unscored rather than contaminated. The LiteLLM `judge` alias remains for
+manual probing only — no public alias, no fallback ladder targets it.
+
+> **Off-cluster Endpoints caveat:** ArgoCD's `argocd-cm` excludes
+> `Endpoints`/`EndpointSlice` from management, so `18-mac-short-judge.yaml`'s
+> Endpoints object must be **`kubectl apply`-ed once by hand** — the Service
+> alone resolves to nothing. The Macs are not cluster members; this manual
+> Endpoints is the only bridge.
 
 ---
 
@@ -151,12 +170,63 @@ A judge you don't calibrate is a judge you can't trust:
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Multi-dim score schema (`scores` jsonb, `judge_*`, `composite_score`) + views | **landing** |
-| 2 | Judge lane: MLX on `short` + LiteLLM `judge` alias + runner judge grader | next |
+| 1 | Multi-dim score schema (`scores` jsonb, `judge_*`, `composite_score`) + views | **done** |
+| 2 | Judge lane: MLX on `short` + direct runner judge grader + integrity guard | **done** |
 | 3 | Bias controls: order-randomised pairwise for confirm lane | pending |
 | 4 | Adaptive budget: UCB arms + Bayesian sequential stopping | pending |
-| 8 | Calibration: human spot-check, Cohen's κ in digest, Langfuse export | pending |
+| 8 | Calibration: judge↔grader agreement + Cohen's κ in digest, Langfuse export | pending |
 
 Schema changes are **additive** (`ADD COLUMN IF NOT EXISTS`); the deterministic
 `grader_score` stays populated for backward-compatible dashboards and as the
 `correctness` axis input.
+
+---
+
+## 8. Operational hardening (lessons from the Phase 1–2 rollout)
+
+These bit us in production; the fixes are in the manifests/seed, but the
+*reasons* live here so they are not re-introduced.
+
+1. **Pin bench jobs to amd64.** `schema-job.yaml` and both bench CronJobs
+   pull images and `pip install` at startup. When the scheduler placed them on
+   an arm64 Pi (`top`/`bottom`/`hailo`) — whose DNS intermittently fails
+   `lookup registry-1.docker.io` — the pod wedged in `ImagePullBackOff`. For
+   the schema *Sync hook* that silently blocked the **entire** ArgoCD sync, so
+   no code or seed update could land. All three carry
+   `nodeSelector: kubernetes.io/arch: amd64` (nodes: alef, thebeast, blade).
+
+2. **The seed SQL is a quoted heredoc — mind two escaping traps:**
+   - **Backslash:** with `standard_conforming_strings=on` a backslash is
+     literal in SQL, so a regex metaclass is written **once** (`\b` → stored
+     `\b` → Python word boundary). Doubling it to `\\b` stores a literal
+     backslash and the grader matches nothing — correct answers score 0.
+   - **Apostrophe:** a literal `'` in a pattern (e.g. `can't`) is a SQL string
+     delimiter and must be **doubled** (`''`). Shell-style `'\''` is verbatim
+     inside the quoted heredoc and silently terminates the SQL literal,
+     aborting the whole seed.
+   Validate the seed before relying on a deploy:
+   `awk` the SQL out of the manifest and run it wrapped in `BEGIN; … ROLLBACK;`
+   against the DB with `-v ON_ERROR_STOP=1` — it parses everything and changes
+   nothing.
+
+3. **View columns can't be reordered with `CREATE OR REPLACE`.** Adding the
+   Phase-1 columns mid-list errored (`cannot change name of view column`). The
+   seed `DROP VIEW IF EXISTS` then `CREATE` for `recent_done`/`model_summary`.
+
+4. **The grader runs in Python `re`, not Postgres.** `\b` is a word boundary in
+   Python but a backspace in Postgres ARE (which uses `\y`). Validate grader
+   patterns with Python, not a `~*` query, or you get false negatives.
+
+5. **Recovering a wedged ArgoCD hook (no CLI).** A hook stuck Running blocks the
+   op; clearing its `argocd.argoproj.io/hook-finalizer` by hand can leave the op
+   tracking a vanished job. Terminate Argo-natively via the CRD:
+   `kubectl -n argocd patch application quirm --type merge -p
+   '{"status":{"operationState":{"phase":"Terminating"}}}'` (the Application
+   has no status subresource, so a plain merge updates status), then re-trigger
+   by patching `.operation` with the target `sync.revision`.
+
+> **Historical-data note:** runs graded *before* the regex fix carry false
+> `grader_score = 0`. Their `composite_score` was still computed (from the other
+> axes), but model rankings that lean on pre-fix `correctness` are biased low.
+> Treat the fix commit as the calibration epoch; Phase 8's κ check should ignore
+> rows older than it.
