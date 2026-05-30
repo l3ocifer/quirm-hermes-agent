@@ -252,6 +252,35 @@ spec:
                 WHERE status = 'done' AND finished_at > now() - interval '14 days'
                 GROUP BY model;
 
+              -- Phase 8 calibration: judge ↔ deterministic-grader agreement.
+              -- On rows where BOTH a judge_score and a grader_score exist, how
+              -- often do they agree on pass/fail (≥0.5)? Persistent disagreement
+              -- is an early-warning signal:
+              --   judge_pass_grader_fail  → the grader may be losing answers
+              --     (exactly the broken-regex failure mode), OR the judge is lax.
+              --   judge_fail_grader_pass  → the grader is over-permissive, OR the
+              --     judge is harsh / mis-prompted.
+              -- A human spot-check turns agreement_rate into a true Cohen's κ; this
+              -- view is the cheap always-on proxy the digest reads each day.
+              DROP VIEW IF EXISTS bench.judge_calibration;
+              CREATE VIEW bench.judge_calibration AS
+                SELECT p.class,
+                       count(*)                                            AS n_dual_scored,
+                       avg(((e.judge_score >= 0.5) = (e.grader_score >= 0.5))::int)::float
+                                                                           AS agreement_rate,
+                       count(*) FILTER (WHERE e.judge_score >= 0.5 AND e.grader_score < 0.5)
+                                                                           AS judge_pass_grader_fail,
+                       count(*) FILTER (WHERE e.judge_score < 0.5 AND e.grader_score >= 0.5)
+                                                                           AS judge_fail_grader_pass,
+                       max(e.finished_at)                                  AS last_run
+                  FROM bench.experiments e
+                  JOIN bench.prompts p ON p.id = e.prompt_id
+                 WHERE e.status = 'done'
+                   AND e.judge_score  IS NOT NULL
+                   AND e.grader_score IS NOT NULL
+                   AND e.finished_at > now() - interval '14 days'
+                 GROUP BY p.class;
+
               GRANT USAGE ON SCHEMA bench TO quirm;
               GRANT ALL ON ALL TABLES IN SCHEMA bench TO quirm;
               GRANT ALL ON ALL SEQUENCES IN SCHEMA bench TO quirm;
