@@ -1,9 +1,11 @@
 # Quirm eval architecture — multi-dimensional scoring with a dedicated judge
 
-Status: **live** — Phases 1 & 2 deployed and verified end-to-end (composite +
-judge scores landing with the correct backend `judge_model` and rationales;
-deterministic grader regex corrected so right answers no longer score 0).
-Phases 3, 4, 8 pending.
+Status: **live** — Phases 1–4 + 8 deployed. Pointwise composite + judge scores
+land with the correct backend `judge_model` and rationales; deterministic grader
+regex corrected so right answers no longer score 0. The proposer now selects via
+UCB1 with Bayesian sequential stopping, queues order-randomised pairwise
+comparisons for close matchups, and calibration tables/views (Cohen's κ, optional
+Langfuse export) are in place awaiting their first human audit sample.
 Owner: Quirm (Hermes agent). Consumed by the bench proposer/runner/analyzer loop.
 
 This is the design for moving Quirm's auto-research loop off **binary pass/fail
@@ -132,37 +134,53 @@ manual probing only — no public alias, no fallback ladder targets it.
 
 ---
 
-## 4. Bias controls (Phase 3)
+## 4. Bias controls (Phase 3) — **done**
 
 - **Pointwise with rubric** for the per-run quality axis (cheap, scales).
-- **Pairwise, order-randomised** for the confirm lane: when two models are close
-  on composite, run A-vs-B *and* B-vs-A and average, to cancel position bias.
-- **No length leakage:** the rubric instructs the judge to ignore verbosity;
-  cost/latency axes already penalise needless length separately.
+- **Pairwise, order-randomised** for the confirm lane: the proposer
+  (`pairwise_candidates`) finds models within `BENCH_PAIRWISE_MARGIN` (0.06) on a
+  prompt and enqueues a row into the new `bench.pairwise` queue. The runner
+  (`run_pairwise`) generates a fresh temp-0 answer for each model, then asks the
+  judge **A-vs-B *and* B-vs-A** (`judge_pairwise`) and averages the two
+  A-preferences. `position_bias = |pref_ab − pref_ba|` is persisted; a flip
+  (≥0.5) emits a `judge_position_bias` finding. The judge call goes **direct to
+  the MLX backend** with the same integrity guard as the pointwise lane, so a
+  rerouted/failed comparison is dropped (status `error`), never trusted.
+- **No length leakage:** the pairwise rubric explicitly tells the judge to ignore
+  length/order/style; cost/latency axes penalise needless length separately.
+- Digest view: `bench.pairwise_summary` (avg `pref_a`, avg `position_bias`/pair).
 
 ---
 
-## 5. Adaptive budget (Phase 4)
+## 5. Adaptive budget (Phase 4) — **done**
 
-The loop has finite GPU/Mac time, so the proposer should spend it where it buys
-the most ranking information:
+The loop has finite GPU/Mac time, so the proposer spends it where it buys the
+most ranking information (`read_arm_stats` → `ucb_targets` / `is_settled`):
 
-- **UCB arm selection:** treat (model × prompt-class) as bandit arms; pull the
-  arms whose ranking is most uncertain, not a uniform sweep.
-- **Bayesian sequential stopping:** stop sampling a (model, prompt) pair once the
-  score's credible interval is tight enough to rank it confidently; reallocate
-  the saved runs to contested pairs.
+- **UCB1 arm selection:** an arm is a (model, prompt) pair. Among arms past the
+  bootstrap min that are *not* settled, score `mean + BENCH_UCB_C·√(ln N / n)` and
+  sample the top `BENCH_CONFIRM_TOP_N` — exploiting high composite while exploring
+  uncertain arms, instead of a uniform sweep.
+- **Sequential stopping:** an arm is *settled* once its 95 % CI half-width
+  (`bench.arm_stats.ci_halfwidth`) ≤ `BENCH_CI_EPSILON` (0.08) or it hits
+  `BENCH_MAX_RUNS_PER_PAIR` (12). Settled arms are skipped; the freed budget flows
+  to contested arms. Coverage still guarantees every arm reaches the bootstrap min.
 
 ---
 
-## 6. Calibration loop (Phase 8)
+## 6. Calibration loop (Phase 8) — **done (awaiting first audit sample)**
 
 A judge you don't calibrate is a judge you can't trust:
 
-- Sample N judged runs/week for a human spot-check; compute **Cohen's κ**
-  between human and judge and surface it in the daily digest.
-- Push per-axis scores + rationale to **Langfuse** for trend/drift visibility.
-- If κ drifts, re-pin or re-prompt the judge — never silently let it move.
+- **Always-on proxy:** `bench.judge_calibration` (judge↔deterministic-grader
+  agreement) ships with Phase 1 and runs every day with zero human effort.
+- **Human spot-check:** pull a weekly random sample from `bench.judge_audit_queue`
+  (judged runs not yet audited), record `human_score` into `bench.judge_audit`;
+  `bench.judge_kappa` computes **Cohen's κ** (both binarised at 0.5) for the digest.
+  κ < ~0.4 ⇒ re-pin or re-prompt the judge — never silently let it move.
+- **Langfuse export:** env-gated (`LANGFUSE_HOST` + keys). `langfuse_export` mirrors
+  every scored run as a trace + per-axis scores; absent config or any error is
+  swallowed so observability is never load-bearing.
 
 ---
 
@@ -172,9 +190,9 @@ A judge you don't calibrate is a judge you can't trust:
 |---|---|---|
 | 1 | Multi-dim score schema (`scores` jsonb, `judge_*`, `composite_score`) + views | **done** |
 | 2 | Judge lane: MLX on `short` + direct runner judge grader + integrity guard | **done** |
-| 3 | Bias controls: order-randomised pairwise for confirm lane | pending |
-| 4 | Adaptive budget: UCB arms + Bayesian sequential stopping | pending |
-| 8 | Calibration: judge↔grader agreement + Cohen's κ in digest, Langfuse export | pending |
+| 3 | Bias controls: `bench.pairwise` queue + order-randomised `run_pairwise` + `position_bias` | **done** |
+| 4 | Adaptive budget: `bench.arm_stats` + UCB1 (`ucb_targets`) + sequential stopping (`is_settled`) | **done** |
+| 8 | Calibration: `judge_calibration` + `judge_audit`/`judge_kappa` (Cohen's κ) + Langfuse export | **done** |
 
 Schema changes are **additive** (`ADD COLUMN IF NOT EXISTS`); the deterministic
 `grader_score` stays populated for backward-compatible dashboards and as the

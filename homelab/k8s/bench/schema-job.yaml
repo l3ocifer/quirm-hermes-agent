@@ -155,6 +155,62 @@ spec:
                 ON bench.findings (created_at DESC)
                 WHERE seen_by_user = false;
 
+              -- ── Phase 3: order-randomised pairwise comparisons ──────────────
+              -- The confirm lane queues head-to-head A-vs-B comparisons for
+              -- models that are statistically close on composite. The runner
+              -- generates both answers, then asks the judge TWICE with the
+              -- answer order swapped and averages — cancelling the judge's
+              -- position bias (favouring whichever answer it saw first).
+              --   pref_a        order-bias-cancelled preference for A in [0,1]
+              --                 (1=A clearly better, 0.5=tie, 0=B clearly better)
+              --   pref_ab/pref_ba  the per-order A-preferences before averaging
+              --   position_bias |pref_ab - pref_ba|: how much order swayed the
+              --                 judge. Persistently high = the judge is unreliable
+              --                 for this class and pointwise scores need caution.
+              CREATE TABLE IF NOT EXISTS bench.pairwise (
+                id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                prompt_id     text NOT NULL REFERENCES bench.prompts(id),
+                prompt_version int NOT NULL DEFAULT 1,
+                model_a       text NOT NULL,
+                model_b       text NOT NULL,
+                proposed_by   text NOT NULL,
+                status        text NOT NULL DEFAULT 'queued'
+                                  CHECK (status IN ('queued','running','done','error')),
+                priority      int  NOT NULL DEFAULT 90,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                started_at    timestamptz,
+                finished_at   timestamptz,
+                runner_pod    text,
+                judge_model   text,
+                answer_a      text,
+                answer_b      text,
+                pref_ab       real,
+                pref_ba       real,
+                pref_a        real,
+                position_bias real,
+                rationale     text,
+                error         text
+              );
+
+              CREATE INDEX IF NOT EXISTS pairwise_queued_idx
+                ON bench.pairwise (priority, created_at)
+                WHERE status = 'queued';
+
+              -- ── Phase 8: judge calibration audit (human spot-check) ─────────
+              -- A human grades a weekly sample of judged runs; we compare human
+              -- vs judge with Cohen's kappa (see bench.judge_kappa). human_score
+              -- is the human's [0,1] quality call on the SAME response the judge
+              -- scored. A judge you don't calibrate is a judge you can't trust.
+              CREATE TABLE IF NOT EXISTS bench.judge_audit (
+                id            uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                experiment_id uuid NOT NULL REFERENCES bench.experiments(id),
+                human_score   real NOT NULL CHECK (human_score >= 0 AND human_score <= 1),
+                auditor       text NOT NULL,
+                note          text,
+                created_at    timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (experiment_id, auditor)
+              );
+
               -- Seed the v1 eval set. Keep this list short (~10 prompts)
               -- so a full sweep finishes inside a single overnight window.
               -- Tags double as filters for the proposer.
@@ -287,6 +343,85 @@ spec:
                    AND e.grader_score IS NOT NULL
                    AND e.finished_at > now() - interval '14 days'
                  GROUP BY p.class;
+
+              -- Phase 4: per-arm stats for UCB selection + sequential stopping.
+              -- An "arm" is a (model, prompt) pair. ci_halfwidth is the 95%
+              -- normal-approx half-width of the composite mean; the proposer
+              -- stops sampling an arm once this is small enough (confident rank)
+              -- or it hits the run cap, and spends the freed budget on the arms
+              -- whose ranking is still uncertain. Exposed as a view so the digest
+              -- can show which pairs are settled vs contested.
+              DROP VIEW IF EXISTS bench.arm_stats;
+              CREATE VIEW bench.arm_stats AS
+                SELECT e.model,
+                       e.prompt_id,
+                       p.class,
+                       count(*)                                              AS n_runs,
+                       avg(COALESCE(e.composite_score, e.grader_score))::float AS mean_composite,
+                       COALESCE(stddev_samp(COALESCE(e.composite_score, e.grader_score)), 0)::float
+                                                                             AS stddev_composite,
+                       (1.96 * COALESCE(stddev_samp(COALESCE(e.composite_score, e.grader_score)), 0)
+                             / sqrt(count(*)))::float                        AS ci_halfwidth,
+                       max(e.finished_at)                                    AS last_run
+                  FROM bench.experiments e
+                  JOIN bench.prompts p ON p.id = e.prompt_id
+                 WHERE e.status = 'done'
+                   AND e.finished_at > now() - interval '30 days'
+                 GROUP BY e.model, e.prompt_id, p.class;
+
+              -- Phase 8: Cohen's kappa between the human spot-check and the judge
+              -- (both binarised at 0.5). κ≈1 trustworthy; κ<~0.4 means re-pin or
+              -- re-prompt the judge. NULL until enough rows are audited.
+              DROP VIEW IF EXISTS bench.judge_kappa;
+              CREATE VIEW bench.judge_kappa AS
+                WITH base AS (
+                  SELECT count(*)::float AS n,
+                         count(*) FILTER (WHERE au.human_score >= 0.5 AND e.judge_score >= 0.5)::float AS both_pass,
+                         count(*) FILTER (WHERE au.human_score <  0.5 AND e.judge_score <  0.5)::float AS both_fail,
+                         count(*) FILTER (WHERE au.human_score >= 0.5)::float AS human_pass,
+                         count(*) FILTER (WHERE e.judge_score  >= 0.5)::float AS judge_pass
+                    FROM bench.judge_audit au
+                    JOIN bench.experiments e ON e.id = au.experiment_id
+                   WHERE e.judge_score IS NOT NULL
+                ),
+                calc AS (
+                  SELECT n,
+                         CASE WHEN n > 0 THEN (both_pass + both_fail) / n END AS po,
+                         CASE WHEN n > 0 THEN (human_pass/n)*(judge_pass/n)
+                                            + (1 - human_pass/n)*(1 - judge_pass/n) END AS pe
+                    FROM base
+                )
+                SELECT n::int AS n_audited,
+                       po AS observed_agreement,
+                       pe AS expected_agreement,
+                       CASE WHEN pe IS NOT NULL AND pe < 1 THEN (po - pe) / (1 - pe) END AS cohens_kappa
+                  FROM calc;
+
+              -- Phase 8: sampling pool — judged runs a human has NOT yet audited.
+              -- Pull a weekly random sample from here to feed bench.judge_audit.
+              DROP VIEW IF EXISTS bench.judge_audit_queue;
+              CREATE VIEW bench.judge_audit_queue AS
+                SELECT e.id AS experiment_id, e.model, e.prompt_id, e.judge_score,
+                       e.judge_rationale, e.result_text, e.finished_at
+                  FROM bench.experiments e
+                  LEFT JOIN bench.judge_audit au ON au.experiment_id = e.id
+                 WHERE e.status = 'done'
+                   AND e.judge_score IS NOT NULL
+                   AND au.id IS NULL
+                   AND e.finished_at > now() - interval '14 days';
+
+              -- Phase 3 digest: pairwise outcomes + how position-biased the judge
+              -- was on each matchup (high avg_position_bias = order-sensitive judge).
+              DROP VIEW IF EXISTS bench.pairwise_summary;
+              CREATE VIEW bench.pairwise_summary AS
+                SELECT prompt_id, model_a, model_b,
+                       count(*)               AS n,
+                       avg(pref_a)::float     AS avg_pref_a,
+                       avg(position_bias)::float AS avg_position_bias,
+                       max(finished_at)       AS last_run
+                  FROM bench.pairwise
+                 WHERE status = 'done' AND pref_a IS NOT NULL
+                 GROUP BY prompt_id, model_a, model_b;
 
               GRANT USAGE ON SCHEMA bench TO quirm;
               GRANT ALL ON ALL TABLES IN SCHEMA bench TO quirm;

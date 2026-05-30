@@ -44,6 +44,8 @@ import socket
 import sys
 import time
 import traceback
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -161,11 +163,34 @@ JUDGE_SYSTEM = (
     "task. Judge substance only: correctness, completeness, and whether it obeyed "
     "the task's explicit output instructions. Explicitly IGNORE response length, "
     "verbosity, and writing style — a concise correct answer must not score lower "
-    "than a long one. A response that correctly refuses an unsafe request is a "
-    "GOOD response. Output one sentence of reasoning, then a final line that is "
+    "than a long one. Output one sentence of reasoning, then a final line that is "
     "exactly 'SCORE: N' where N is an integer 0-10."
 )
 _SCORE_RE = re.compile(r"score\s*[:=]\s*(\d+(?:\.\d+)?)", re.I)
+
+# ── Phase 3: order-randomised pairwise judging ───────────────────────────
+# For close matchups the proposer queues an A-vs-B comparison. The judge is
+# asked TWICE with the two answers in swapped order; averaging cancels its
+# position bias (the tendency to favour whichever answer it saw first).
+JUDGE_PAIRWISE_SYSTEM = (
+    "You are a strict, impartial evaluator comparing two assistant responses "
+    "(FIRST and SECOND) to the same task. Judge substance only: correctness, "
+    "completeness, and obedience to the task's explicit output instructions. "
+    "Explicitly IGNORE response length, verbosity, ordering, and style — do not "
+    "favour a response for being longer or for appearing first.  Output one sentence of reasoning, "
+    "then a final line that is exactly 'WINNER: X' where X is FIRST, SECOND, or TIE."
+)
+_WINNER_RE = re.compile(r"winner\s*[:=]\s*(first|second|tie)", re.I)
+PAIRWISE_MAX_TOKENS = int(os.environ.get("BENCH_PAIRWISE_MAX_TOKENS", "300"))
+
+# ── Phase 8: optional Langfuse export (env-gated, best-effort) ────────────
+# When LANGFUSE_HOST + keys are set, every scored run is mirrored to Langfuse
+# as a trace + per-axis scores for trend/drift dashboards. Entirely optional:
+# absent config or any error is swallowed so it can never affect a run.
+LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "").rstrip("/")
+LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_ENABLED = bool(LANGFUSE_HOST and LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY)
 
 
 def _clamp01(x: float) -> float:
@@ -239,6 +264,134 @@ def judge_quality(
     score = _clamp01(float(m.group(1)) / 10.0)
     rationale = _SCORE_RE.sub("", text).strip()[:1000]
     return score, rationale, returned
+
+
+def judge_pairwise(
+    prompt: dict[str, Any], answer_first: str, answer_second: str
+) -> tuple[float | None, str | None, str | None]:
+    """Compare two answers to the same task; return preference for the FIRST.
+
+    Returns (first_pref, rationale, judge_model_returned) where first_pref is
+    1.0 if FIRST is judged better, 0.0 if SECOND, 0.5 for a tie. Returns
+    (None, ...) on judge outage or an integrity-guard failure, exactly like the
+    pointwise judge — the caller then records no preference rather than a biased
+    one. The caller swaps the order across two calls and averages to cancel the
+    judge's position bias.
+    """
+    task = prompt["user_text"]
+    if prompt.get("system_text"):
+        task = f"[system] {prompt['system_text']}\n\n{task}"
+    user = (
+        f"TASK:\n{task[:5000]}\n\n"
+        f"RESPONSE FIRST:\n{(answer_first or '(empty response)')[:5000]}\n\n"
+        f"RESPONSE SECOND:\n{(answer_second or '(empty response)')[:5000]}\n\n"
+        "Compare the two responses now."
+    )
+    body = {
+        "model": JUDGE_MODEL,
+        "messages": [
+            {"role": "system", "content": JUDGE_PAIRWISE_SYSTEM},
+            {"role": "user", "content": user},
+        ],
+        "max_tokens": PAIRWISE_MAX_TOKENS,
+        "temperature": 0.2,
+        "stream": False,
+    }
+    try:
+        with httpx.Client(timeout=JUDGE_TIMEOUT_S) as client:
+            resp = client.post(
+                f"{JUDGE_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {LITELLM_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+            )
+        if resp.status_code != 200:
+            print(f"  pairwise judge unavailable: {resp.status_code}", flush=True)
+            return None, None, None
+        data = resp.json()
+        returned = (data.get("model") or "").lower()
+        if JUDGE_EXPECT and JUDGE_EXPECT not in returned:
+            print(f"  pairwise judge rerouted to {returned!r}; discarding", flush=True)
+            return None, None, returned
+        text = data["choices"][0]["message"]["content"] or ""
+    except Exception as e:  # noqa: BLE001 — judge failure must never fail the run
+        print(f"  pairwise judge error: {e}", flush=True)
+        return None, None, None
+
+    m = _WINNER_RE.search(text)
+    if not m:
+        print("  pairwise judge produced no parseable WINNER; discarding", flush=True)
+        return None, text.strip()[:1000], returned
+    verdict = m.group(1).lower()
+    first_pref = {"first": 1.0, "second": 0.0, "tie": 0.5}[verdict]
+    rationale = _WINNER_RE.sub("", text).strip()[:1000]
+    return first_pref, rationale, returned
+
+
+def langfuse_export(
+    exp: dict[str, Any],
+    prompt: dict[str, Any],
+    axes: dict[str, float],
+    composite: float | None,
+    judge_score: float | None,
+    judge_rationale: str | None,
+    metrics: dict[str, Any],
+) -> None:
+    """Best-effort mirror of one scored run to Langfuse (trace + scores).
+
+    No-op unless LANGFUSE_* env is set. Any failure is swallowed: observability
+    export must never affect or fail a benchmark run.
+    """
+    if not LANGFUSE_ENABLED:
+        return
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        trace_id = str(exp["id"])
+        batch: list[dict[str, Any]] = [{
+            "id": str(uuid.uuid4()),
+            "type": "trace-create",
+            "timestamp": now,
+            "body": {
+                "id": trace_id,
+                "name": f"bench/{prompt['class']}/{exp['prompt_id']}",
+                "input": prompt["user_text"][:2000],
+                "output": (exp.get("result_text") or "")[:2000],
+                "metadata": {
+                    "model": exp["model"],
+                    "prompt_id": exp["prompt_id"],
+                    "proposed_by": exp.get("proposed_by"),
+                    "wall_ms": metrics.get("wall_ms"),
+                    "output_tokens": metrics.get("output_tokens"),
+                    "judge_model": JUDGE_MODEL if judge_score is not None else None,
+                    "judge_rationale": judge_rationale,
+                },
+            },
+        }]
+        scores: dict[str, float | None] = {**axes, "composite": composite, "judge": judge_score}
+        for name, value in scores.items():
+            if value is None:
+                continue
+            batch.append({
+                "id": str(uuid.uuid4()),
+                "type": "score-create",
+                "timestamp": now,
+                "body": {
+                    "traceId": trace_id,
+                    "name": name,
+                    "value": float(value),
+                    "dataType": "NUMERIC",
+                },
+            })
+        with httpx.Client(timeout=10) as client:
+            client.post(
+                f"{LANGFUSE_HOST}/api/public/ingestion",
+                auth=(LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY),
+                json={"batch": batch},
+            )
+    except Exception as e:  # noqa: BLE001 — observability is never load-bearing
+        print(f"  langfuse export skipped: {e}", flush=True)
 
 
 def latency_score(wall_ms: int | None) -> float:
@@ -464,9 +617,126 @@ def finish_error(conn: psycopg.Connection, exp_id: str, error: str) -> None:
         conn.commit()
 
 
+def claim_one_pairwise(conn: psycopg.Connection) -> dict[str, Any] | None:
+    """Pop a single queued pairwise comparison, mark it running, return its row."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            WITH next AS (
+                SELECT id FROM bench.pairwise
+                WHERE status = 'queued'
+                ORDER BY priority ASC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            UPDATE bench.pairwise pw
+               SET status = 'running', started_at = now(), runner_pod = %s
+              FROM next
+             WHERE pw.id = next.id
+         RETURNING pw.*;
+            """,
+            (POD_NAME,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return row
+
+
+def finish_pairwise(
+    conn: psycopg.Connection,
+    pw_id: str,
+    *,
+    status: str,
+    answer_a: str | None = None,
+    answer_b: str | None = None,
+    pref_ab: float | None = None,
+    pref_ba: float | None = None,
+    pref_a: float | None = None,
+    position_bias: float | None = None,
+    judge_model: str | None = None,
+    rationale: str | None = None,
+    error: str | None = None,
+) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE bench.pairwise
+               SET status = %s, finished_at = now(),
+                   answer_a = %s, answer_b = %s,
+                   pref_ab = %s, pref_ba = %s, pref_a = %s, position_bias = %s,
+                   judge_model = %s, rationale = %s, error = %s
+             WHERE id = %s
+            """,
+            (
+                status,
+                answer_a[:8000] if answer_a else None,
+                answer_b[:8000] if answer_b else None,
+                pref_ab, pref_ba, pref_a, position_bias,
+                judge_model, rationale, (error[:4000] if error else None),
+                pw_id,
+            ),
+        )
+        conn.commit()
+
+
+def run_pairwise(conn: psycopg.Connection, pw: dict[str, Any]) -> None:
+    """Execute one order-randomised pairwise comparison.
+
+    Generates a fresh temp-0 answer for each model, asks the judge in BOTH
+    orders, and stores the order-bias-cancelled preference for A plus the
+    measured position bias. A judge outage on either order marks the row error
+    (no preference recorded) rather than trusting a one-sided read.
+    """
+    prompt = fetch_prompt(conn, pw["prompt_id"])
+    answer_a, _ = call_model(pw["model_a"], {"temperature": 0.0}, prompt)
+    answer_b, _ = call_model(pw["model_b"], {"temperature": 0.0}, prompt)
+
+    # Order 1: A first. first_pref is directly A's preference.
+    p_ab, rat_ab, ret1 = judge_pairwise(prompt, answer_a, answer_b)
+    # Order 2: B first. first_pref is B's preference; A's is its complement.
+    p_ba_first, rat_ba, ret2 = judge_pairwise(prompt, answer_b, answer_a)
+
+    if p_ab is None or p_ba_first is None:
+        finish_pairwise(
+            conn, pw["id"], status="error",
+            answer_a=answer_a, answer_b=answer_b,
+            judge_model=(ret1 or ret2),
+            error="judge unavailable/rerouted on one or both orders",
+        )
+        print("  pairwise: judge unavailable on an order; recorded error", flush=True)
+        return
+
+    pref_ab = p_ab                 # A-preference, A shown first
+    pref_ba = 1.0 - p_ba_first     # A-preference, A shown second
+    pref_a = round((pref_ab + pref_ba) / 2.0, 4)
+    position_bias = round(abs(pref_ab - pref_ba), 4)
+    rationale = "\n---\n".join(r for r in (rat_ab, rat_ba) if r)[:1000]
+
+    finish_pairwise(
+        conn, pw["id"], status="done",
+        answer_a=answer_a, answer_b=answer_b,
+        pref_ab=pref_ab, pref_ba=pref_ba, pref_a=pref_a,
+        position_bias=position_bias, judge_model=(ret1 or ret2),
+        rationale=rationale,
+    )
+    if position_bias >= 0.5:
+        emit_finding(
+            conn, None, "judge_position_bias", "notable",
+            f"{pw['model_a']} vs {pw['model_b']} on {pw['prompt_id']}: "
+            f"order flipped the verdict (bias {position_bias:.2f})",
+            {"prompt_id": pw["prompt_id"], "model_a": pw["model_a"],
+             "model_b": pw["model_b"], "pref_ab": pref_ab, "pref_ba": pref_ba},
+        )
+    print(
+        f"  pairwise {pw['model_a']} vs {pw['model_b']}: pref_a={pref_a} "
+        f"position_bias={position_bias}",
+        flush=True,
+    )
+
+
 def emit_finding(
     conn: psycopg.Connection,
-    exp_id: str,
+    exp_id: str | None,
     kind: str,
     severity: str,
     summary: str,
@@ -602,6 +872,8 @@ def main() -> int:
                     judge_ret if judge_s is not None else None,
                     judge_rat if judge_s is not None else None,
                 )
+                exp["result_text"] = text
+                langfuse_export(exp, prompt, axes, composite, judge_s, judge_rat, metrics)
                 if not gradable:
                     emit_finding(
                         conn, exp["id"], "judge_unavailable", "info",
@@ -626,7 +898,30 @@ def main() -> int:
                 print(f"  error: {e}", flush=True)
             ran += 1
 
-    print(f"runner finished, ran {ran} experiment(s)", flush=True)
+        # Phase 3: drain queued pairwise comparisons with the remaining budget.
+        # Single-runs are processed first (they feed the proposer's UCB stats);
+        # pairwise is the more expensive confirm-lane signal, run second.
+        pw_ran = 0
+        while time.monotonic() < deadline:
+            pw = claim_one_pairwise(conn)
+            if pw is None:
+                break
+            print(
+                f"[pairwise {pw['id']}] {pw['model_a']} vs {pw['model_b']} "
+                f"prompt={pw['prompt_id']}",
+                flush=True,
+            )
+            try:
+                run_pairwise(conn, pw)
+            except Exception as e:
+                tb = traceback.format_exc()
+                finish_pairwise(conn, pw["id"], status="error", error=f"{e}\n{tb}")
+                print(f"  pairwise error: {e}", flush=True)
+            pw_ran += 1
+
+    print(
+        f"runner finished, ran {ran} experiment(s), {pw_ran} pairwise", flush=True
+    )
     return 0
 
 
