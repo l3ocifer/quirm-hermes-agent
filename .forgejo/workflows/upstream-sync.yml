@@ -23,7 +23,7 @@ permissions:
 
 jobs:
   sync:
-    runs-on: [docker, ubuntu-22.04]
+    runs-on: [docker, ubuntu-24.04]
     if: ${{ vars.UPSTREAM_URL != '' }}
     steps:
       - name: Checkout (full history)
