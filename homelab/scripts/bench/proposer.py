@@ -114,14 +114,21 @@ def coverage_gaps(
 
 
 def confirm_targets(conn: psycopg.Connection, top_n: int) -> list[dict[str, Any]]:
-    """Top-N (model, prompt) by avg score with low run count get more runs."""
+    """Top-N (model, prompt) by avg COMPOSITE score with low run count.
+
+    Ranks on the multi-dimensional `composite_score` (correctness + quality +
+    latency + cost), falling back to the deterministic `grader_score` only for
+    rows graded before Phase 1. Ranking on composite — not the binary grader —
+    is the point of the judge work: the loop spends its confirm budget on the
+    models that win on the blended objective, not just on a regex pass.
+    """
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
             SELECT e.model,
                    e.prompt_id,
                    p.version AS prompt_version,
-                   avg(e.grader_score)::float AS avg_score,
+                   avg(COALESCE(e.composite_score, e.grader_score))::float AS avg_score,
                    count(*) AS runs
               FROM bench.experiments e
               JOIN bench.prompts p ON p.id = e.prompt_id
