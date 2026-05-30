@@ -25,7 +25,14 @@ metadata:
   namespace: agents-shared
   annotations:
     argocd.argoproj.io/sync-wave: "5"
-    # Hash of the embedded SQL — bump to force re-run.
+    # NOTE: a change to THIS hook's embedded SQL alone does not trigger an
+    # ArgoCD sync (only non-hook resource drift does), so the seed won't
+    # re-run on a seed-only commit. Either pair the change with a tracked
+    # resource edit, or force one explicit sync:
+    #   kubectl -n argocd patch application quirm --type merge \
+    #     -p '{"operation":{"sync":{"revision":"<sha>","syncStrategy":{"hook":{}}}}}'
+    # The seed is idempotent (ON CONFLICT DO UPDATE + DROP/CREATE views), so
+    # re-running is always safe.
     argocd.argoproj.io/hook: Sync
     argocd.argoproj.io/hook-delete-policy: BeforeHookCreation,HookSucceeded
 spec:
