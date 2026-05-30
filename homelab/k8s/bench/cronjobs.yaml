@@ -92,8 +92,14 @@ spec:
                 # invariant above. frontier = CPU 480B MoE on blade (~1-2 tok/s).
                 - { name: BENCH_MODEL_TIMEOUTS, value: '{"frontier":900,"long":300}' }
                 # Multi-dimensional scoring: pinned cross-family LLM-as-judge.
+                # Called DIRECTLY at the Mac MLX backend (NOT via the LiteLLM
+                # router) so a judge outage can never be silently rerouted onto a
+                # candidate lane — see runner.py JUDGE_BASE rationale. The model
+                # id MUST be the exact id mlx_lm.server loaded on short; the
+                # integrity guard (BENCH_JUDGE_EXPECT) matches its family.
                 - { name: BENCH_JUDGE_MODE,     value: "open_ended" }
-                - { name: BENCH_JUDGE_MODEL,    value: "judge" }
+                - { name: BENCH_JUDGE_BASE,     value: "http://mac-short-judge.inference.svc.cluster.local:8081/v1" }
+                - { name: BENCH_JUDGE_MODEL,    value: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit" }
                 - { name: BENCH_JUDGE_EXPECT,   value: "llama" }
                 - { name: BENCH_JUDGE_TIMEOUT_S, value: "120" }
                 - { name: OPENAI_BASE_URL, value: "http://litellm.inference.svc.cluster.local:4000/v1" }

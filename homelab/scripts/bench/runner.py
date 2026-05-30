@@ -109,6 +109,19 @@ def model_timeout(model: str) -> int:
 # `format` is presently enforced *inside* the deterministic correctness
 # graders (jsonpath/regex already check output shape); it is split into its
 # own axis in a later phase.
+# The judge is called DIRECTLY at its backend (the Mac MLX server), NOT through
+# the LiteLLM router. Two reasons: (1) the router echoes the alias name in the
+# response `model` field, so the cross-family integrity check below can't see
+# the real backend; (2) far more important, the router's default_fallbacks would
+# silently reroute a failed judge call onto a Qwen/Gemma *candidate* lane — the
+# exact self-preference contamination the dedicated judge exists to remove.
+# Calling the backend directly means a judge outage just fails the call (→
+# deterministic-only degrade) instead of quietly substituting a biased judge.
+# BENCH_JUDGE_BASE defaults to the LiteLLM base for back-compat; the CronJob
+# points it straight at mac-short-judge.inference.svc.
+JUDGE_BASE = os.environ.get("BENCH_JUDGE_BASE", LITELLM_BASE).rstrip("/")
+# Backend model id. Direct to the Mac, this MUST be the exact id mlx_lm.server
+# loaded (it 404s on anything else); the integrity guard then matches it.
 JUDGE_MODEL = os.environ.get("BENCH_JUDGE_MODEL", "judge")
 # Substring the judge's returned model id MUST contain. The judge is pinned
 # and cross-family; if LiteLLM silently reroutes a judge call onto a
@@ -198,7 +211,7 @@ def judge_quality(
     try:
         with httpx.Client(timeout=JUDGE_TIMEOUT_S) as client:
             resp = client.post(
-                f"{LITELLM_BASE}/chat/completions",
+                f"{JUDGE_BASE}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {LITELLM_KEY}",
                     "Content-Type": "application/json",
