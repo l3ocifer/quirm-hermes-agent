@@ -96,7 +96,7 @@ voice = [
 ]
 pty = [
   "ptyprocess==0.7.0; sys_platform != 'win32'",
-  "pywinpty==2.0.15; sys_platform == 'win32'",
+  "pywinpty==3.0.3; sys_platform == 'win32'",
 ]
 honcho = ["honcho-ai==2.0.1"]
 mcp = ["mcp==1.26.0"]
