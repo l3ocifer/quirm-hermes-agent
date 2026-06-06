@@ -13,7 +13,7 @@
 
 # syntax=docker/dockerfile:1
 
-FROM python:3.13-slim-bookworm
+FROM python:3.14-slim-bookworm
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
