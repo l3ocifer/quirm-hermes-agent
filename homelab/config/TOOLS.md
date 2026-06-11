@@ -142,3 +142,36 @@ Provided by `quirm-secrets` SealedSecret in `agents-shared`:
 | `OFP_SHARED_SECRET` | A2A mutual auth |
 | `BW_CLIENTID` + `BW_CLIENTSECRET` | Vaultwarden API-key login (`bw login --apikey`) for ad-hoc credential lookups |
 | `HEALTHCHECKS_UUID` | per-agent UUID for hc-ping.com heartbeats |
+
+## Source control & GitOps (fleet convention)
+
+- **Forgejo — `https://git.leopaska.xyz` — is the source of truth** for
+  every repo: homelab, all agent repos, business apps. Clone/push via
+  `origin` (`git@git-ssh.leopaska.xyz` SSH or HTTPS).
+- **GitHub (`l3ocifer/*`) is a push-mirror backup only.** Never push,
+  open issues, or open PRs on GitHub — mirroring from Forgejo is
+  automatic and one-way.
+- **All deploys are GitOps via ArgoCD** (`argocd.leopaska.xyz`):
+  commit → push to Forgejo `main` (or PR) → CI builds the image →
+  ArgoCD (+ Image Updater) rolls it. Never `kubectl apply` desired
+  state by hand; self-heal reverts live edits. Manual
+  `rollout restart` is fine when config in git already changed.
+- **Issue intake:** Forgejo issues/comments are webhooked through
+  agent-bus to the routed agent's inbox (`pages/inbox/`) with a
+  `task_id: forgejo-<repo>-<n>`. Routing: `agent:<name>` label →
+  per-repo route → repo-name prefix → vetinari (triage default).
+- **Acting on issues:** use the Forgejo API with `$FORGEJO_TOKEN`
+  (in this agent's k8s Secret, scopes `write:issue,write:repository`):
+
+  ```bash
+  # comment your result
+  curl -s -X POST -H "Authorization: token $FORGEJO_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"body":"<result>"}' \
+    https://git.leopaska.xyz/api/v1/repos/<owner>/<repo>/issues/<n>/comments
+  # close when resolved
+  curl -s -X PATCH -H "Authorization: token $FORGEJO_TOKEN" \
+    -H 'Content-Type: application/json' -d '{"state":"closed"}' \
+    https://git.leopaska.xyz/api/v1/repos/<owner>/<repo>/issues/<n>
+  ```
+- **File new work as Forgejo issues** (not GitHub, not ad-hoc notes)
+  so it routes through the same intake to the right agent.
