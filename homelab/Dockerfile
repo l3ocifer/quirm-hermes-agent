@@ -61,7 +61,10 @@ COPY . .
 RUN uv pip install --system --no-cache "." \
       pgvector \
       psycopg2-binary \
-      "mautrix[encryption]" \
+      "mautrix[encryption]==0.21.0" \
+      "aiosqlite==0.22.1" \
+      "asyncpg==0.31.0" \
+      "aiohttp-socks==0.11.0" \
       pandas \
       numpy \
       matplotlib \
