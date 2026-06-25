@@ -127,8 +127,10 @@ schedule = "*/30 * * * *"
 # default model (chat) — small SQL pulse, no reasoning.
 prompt   = """
 Pulse-check the benchmark loop. Run **only** these read-only queries on
-database `hermes_quirm` (use DATABASE_URL / terminal tool; one statement
-at a time, no DDL or writes):
+database `hermes_quirm`. Use the terminal tool with the full connection
+string — `psql "$DATABASE_URL" -c "<SQL>"` — one statement at a time, no
+DDL or writes. Never use `psql -U quirm -h …` (it ignores the sealed
+password and fails auth):
 
   SELECT count(*) AS queued FROM bench.experiments WHERE status = 'queued';
   SELECT count(*) AS running FROM bench.experiments WHERE status = 'running'

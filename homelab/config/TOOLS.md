@@ -55,6 +55,14 @@ Quirm does NOT have iMessage access. Internal-facing only.
 | `hermes_quirm` (owner: `quirm`) | RW | session DB, eval history, prototype registry |
 | `ironclaw_frick`, `openclaw_frack`, `hermes_sancho`, `openfang_vetinari`, `ironclaw_vimes`, `openclaw_puck` | RO via `quirm_ro` role | sibling introspection for benchmarks |
 
+**How to query (use the connection string, never `-U`/`-h`):** always pass
+the full DSN env var to `psql` — `psql "$DATABASE_URL" -c "SELECT …"` for your
+own DB (`hermes_quirm`, role `quirm`) and `psql "$FLEET_DATABASE_URL" -c "…"`
+for the shared `fleet` DB. Do **not** run `psql -U quirm -h homelab-pg-rw …`:
+that ignores the sealed password and fails with `password authentication
+failed for user "quirm"`. The bench tables live here too —
+`psql "$DATABASE_URL" -c "SELECT * FROM bench.model_summary"`.
+
 ## Kubernetes access
 
 ServiceAccount `quirm-ops` in `agents-shared`. Cluster-wide
