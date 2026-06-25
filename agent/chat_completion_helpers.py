@@ -34,7 +34,7 @@ from agent.message_sanitization import (
     _repair_tool_call_arguments,
 )
 from tools.terminal_tool import is_persistent_env
-from utils import base_url_host_matches, base_url_hostname, env_int
+from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 
@@ -1042,6 +1042,35 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
+def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
+    """Point the cached system prompt's ``Model:``/``Provider:`` lines at
+    the active runtime after a provider switch.
+
+    The system prompt is session-stable and replayed verbatim for prefix-cache
+    warmth, but after a failover the new backend's cache is cold anyway —
+    while a stale identity line makes the agent misreport which model it is
+    when asked.  Rewrite the lines in place WITHOUT persisting to the session
+    DB: the stored row keeps the primary's labels, so when the primary is
+    restored the prompt is byte-identical to the stored copy again and its
+    prefix cache still matches.
+
+    Only the LAST occurrence of each line is touched — the identity lines
+    live in the volatile tail of the prompt, and earlier matches could be
+    user content (memory snapshots, context files).
+    """
+    sp = getattr(agent, "_cached_system_prompt", None)
+    if not isinstance(sp, str) or not sp:
+        return
+    for label, value in (("Model", model), ("Provider", provider)):
+        if not value:
+            continue
+        matches = list(re.finditer(rf"(?m)^{label}: .*$", sp))
+        if matches:
+            last = matches[-1]
+            sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
+    agent._cached_system_prompt = sp
+
+
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
@@ -1286,6 +1315,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 provider=agent.provider,
                 api_mode=agent.api_mode,
             )
+
+        # Keep the prompt's self-identity in sync with the model actually
+        # answering, so "what model are you?" doesn't report the primary.
+        rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
         agent._buffer_status(
             f"🔄 Primary model failed — switching to fallback: "
@@ -1615,6 +1648,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     _get_bedrock_runtime_client,
                     invalidate_runtime_client,
                     is_stale_connection_error,
+                    is_streaming_access_denied_error,
+                    normalize_converse_response,
                     stream_converse_with_callbacks,
                 )
                 region = api_kwargs.pop("__bedrock_region__", "us-east-1")
@@ -1623,6 +1658,29 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 try:
                     raw_response = client.converse_stream(**api_kwargs)
                 except Exception as _bedrock_exc:
+                    # IAM policies scoped to bedrock:InvokeModel only (no
+                    # InvokeModelWithResponseStream) reject converse_stream()
+                    # with AccessDeniedException. That denial is permanent for
+                    # the session — fall back to the non-streaming converse()
+                    # inline (it maps to bedrock:InvokeModel) and disable
+                    # streaming for subsequent calls so we don't re-fail every
+                    # turn.
+                    if is_streaming_access_denied_error(_bedrock_exc):
+                        agent._disable_streaming = True
+                        agent._safe_print(
+                            "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream — "
+                            "falling back to non-streaming InvokeModel.\n"
+                            "   Grant that action to restore streaming output.\n"
+                        )
+                        logger.info(
+                            "bedrock: converse_stream denied by IAM (%s) — "
+                            "using non-streaming converse() for this session.",
+                            type(_bedrock_exc).__name__,
+                        )
+                        result["response"] = normalize_converse_response(
+                            client.converse(**api_kwargs)
+                        )
+                        return
                     # Evict the cached client on stale-connection failures
                     # so the outer retry loop builds a fresh client/pool.
                     if is_stale_connection_error(_bedrock_exc):
@@ -1736,14 +1794,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _base_timeout = (
             _provider_timeout_cfg
             if _provider_timeout_cfg is not None
-            else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+            else env_float("HERMES_API_TIMEOUT", 1800.0)
         )
         # Read timeout: config wins here too.  Otherwise use
         # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
         if _provider_timeout_cfg is not None:
             _stream_read_timeout = _provider_timeout_cfg
         else:
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            _stream_read_timeout = env_float("HERMES_STREAM_READ_TIMEOUT", 120.0)
             # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
             # prefill on large contexts before producing the first token.
             # Auto-increase the httpx read timeout unless the user explicitly
@@ -2424,9 +2482,34 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             "stream" in _err_lower
                             and "not supported" in _err_lower
                         )
-                        if _is_stream_unsupported:
+                        # AWS Bedrock (AnthropicBedrock SDK path): IAM policies
+                        # with bedrock:InvokeModel but not
+                        # InvokeModelWithResponseStream reject messages.stream()
+                        # with a permission error naming the streaming action.
+                        # Permanent for the session — flip to non-streaming
+                        # (messages.create() maps to bedrock:InvokeModel).
+                        _is_bedrock_stream_denied = False
+                        if (
+                            not _is_stream_unsupported
+                            and "invokemodelwithresponsestream" in _err_lower
+                        ):
+                            # Cheap message pre-check before importing the
+                            # adapter — bedrock_adapter triggers a lazy boto3
+                            # install at import time, which must not run for
+                            # unrelated providers' stream errors.
+                            from agent.bedrock_adapter import (
+                                is_streaming_access_denied_error,
+                            )
+                            _is_bedrock_stream_denied = (
+                                is_streaming_access_denied_error(e)
+                            )
+                        if _is_stream_unsupported or _is_bedrock_stream_denied:
                             agent._disable_streaming = True
                             agent._safe_print(
+                                "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream. "
+                                "Switching to non-streaming.\n"
+                                "   Grant that action to restore streaming output.\n"
+                                if _is_bedrock_stream_denied else
                                 "\n⚠  Streaming is not supported for this "
                                 "model/provider. Switching to non-streaming.\n"
                                 "   To avoid this delay, set display.streaming: false "
@@ -2458,7 +2541,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if _cfg_stale is not None:
         _stream_stale_timeout_base = _cfg_stale
     else:
-        _stream_stale_timeout_base = float(os.getenv("HERMES_STREAM_STALE_TIMEOUT", 180.0))
+        _stream_stale_timeout_base = env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
     # Local providers (Ollama, oMLX, llama-cpp) can take 300+ seconds
     # for prefill on large contexts.  Disable the stale detector unless
     # the user explicitly set HERMES_STREAM_STALE_TIMEOUT.
