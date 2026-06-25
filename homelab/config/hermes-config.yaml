@@ -54,6 +54,22 @@ providers:
         # Hermes-floor lie needed.
         context_length: 65536
 
+# ── Autonomous dispatch→write_file path (mission deliverables) ──────────
+# 2026-06-25: Root the agent's tool working dir at Quirm's Logseq graph so a
+# mission dispatched over the bus (BlueBubbles webhook → gateway turn) that
+# calls write_file('world/<deliverable>.md', …) lands the file on the graph
+# PVC at /data/graphs/quirm/pages/world/<deliverable>.md — exactly the path
+# the mission-orchestrator verifies (os.path.isfile + size>0). This is the
+# Hermes analog of the IronClaw workingDir fix: write_file already targets the
+# real pod FS (backend=local), but TERMINAL_CWD defaulted to /home/hermes, so a
+# relative deliverable path never reached the graph. hermes.toml is vestigial
+# (gateway reads only this config.yaml); runtime knobs belong HERE. Approval
+# mode is left at the default (manual) — write_file is not approval-gated, and
+# weakening approvals fleet-wide would erode the KILLSWITCH posture.
+terminal:
+  backend: local
+  cwd: /data/graphs/quirm/pages
+
 # 2026-05-29: Enable hard-stop guardrails. Default Hermes ships warnings-only,
 # which lets the model burn LiteLLM quota on `skill_manage` (and similar) loops
 # — it sees the warning text appended to tool output but keeps retrying. Hard
