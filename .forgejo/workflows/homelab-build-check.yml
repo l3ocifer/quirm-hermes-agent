@@ -1,0 +1,43 @@
+name: homelab-build-check
+
+# PR safety gate: build the homelab image (WITHOUT pushing) so an unbuildable
+# change is caught on the pull request instead of after merge — closing the gap
+# where homelab-build.yml only runs on push to main (post-merge). Mirrors that
+# workflow's build step, minus the skopeo push.
+#
+# Forgejo-only: once a repo has a .forgejo/workflows/ dir, Forgejo ignores
+# .github/workflows/, so this gate lives here. Hosting-critical (kept on
+# upstream sync per the repo's "keep ours" set).
+
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch: {}
+
+env:
+  REGISTRY_INTERNAL: forgejo-http.forgejo.svc.cluster.local:3000
+
+jobs:
+  build:
+    name: build
+    runs-on: docker
+    steps:
+      - name: Build homelab image (no push)
+        env:
+          # Read-only repo token (auto-issued) for the in-cluster clone.
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # docker:cli reaches the dind sidecar via the bridge gateway.
+          DOCKER_HOST: tcp://172.17.0.1:2375
+        run: |
+          set -eu
+          apk add --no-cache git
+          ref="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          git clone --depth 1 --branch "${ref}" \
+            "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" repo
+          docker build \
+            --tag "homelab-build-check:${GITHUB_SHA}" \
+            --file repo/homelab/Dockerfile \
+            repo
