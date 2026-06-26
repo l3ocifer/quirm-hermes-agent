@@ -100,15 +100,16 @@ bluebubbles = { base_url = "http://bluebubbles-proxy.agents-shared.svc.cluster.l
 [mcp]
 enabled = true
 
+  # Central MCP gateway (ContextForge) — ONE endpoint merging every shared
+  # backend (grafana/Prometheus/Loki, k8s read-only, forgejo,
+  # home-assistant, postgres read-only). Add/update servers centrally in
+  # homelab/argocd/apps/_mcp/70-mcp-gateway.yaml; Quirm picks them up with
+  # no config change.
   [[mcp.servers]]
-  name = "grafana"
-  url = "http://grafana-mcp.mcp.svc.cluster.local:8000/mcp"
-  allowed_tools = [
-    "query_prometheus", "list_prometheus_metric_names",
-    "list_prometheus_label_names", "list_prometheus_label_values",
-    "query_loki_logs", "query_loki_stats",
-    "list_datasources",
-  ]
+  name = "gateway"
+  url = "http://mcp-gateway.mcp.svc.cluster.local:8080/sse"
+  transport = "sse"
+  allowed_tools = ["*"]
 
 [quiet_hours]
 start = "22:00"
