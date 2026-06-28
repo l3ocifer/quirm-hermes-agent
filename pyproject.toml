@@ -101,7 +101,7 @@ dependencies = [
   "psutil==7.2.2",
   # Browser CDP supervisor + browser_dialog import this directly. Keep core
   # so browser tool discovery doesn't fail on lean installs.
-  "websockets==15.0.1",
+  "websockets==16.0",
   # .gitignore-aware file matching for desktop build stamp.
   "pathspec==1.1.1",
   "fastapi>=0.104.0,<1",
