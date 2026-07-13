@@ -23,7 +23,7 @@ jobs:
           submodules: false   # tinker-atropos not needed at runtime; homelab/shared excluded by .dockerignore
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Cache buildx layers
         uses: actions/cache@v4
