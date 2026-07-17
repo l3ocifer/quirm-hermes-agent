@@ -76,7 +76,12 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
   return (
     <StatusRow
       leading={
-        <Codicon aria-hidden className={cn('text-muted-foreground/70', opening && 'animate-pulse')} name="globe" size="0.8rem" />
+        <Codicon
+          aria-hidden
+          className={cn('text-muted-foreground/70', opening && 'animate-pulse')}
+          name="globe"
+          size="0.8rem"
+        />
       }
       // Plain click opens the link in the browser; ⌘/Ctrl-click opens it in the
       // in-app preview pane instead. (isOpen still toggles the pane closed.)
@@ -108,7 +113,9 @@ export const PreviewStatusRow = memo(function PreviewStatusRow({ item, onDismiss
     >
       <Tip
         label={
-          <span className="flex flex-col gap-0.5">
+          // inline-flex (not flex): a block child collapses Tip's decoration
+          // wrapper geometry and mis-positions the tooltip (#62022).
+          <span className="inline-flex flex-col gap-0.5">
             <span>{item.target}</span>
             <span className="opacity-70">{t.preview.linkHint}</span>
           </span>

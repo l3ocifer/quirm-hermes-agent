@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_WEBHOOK_HOST = "127.0.0.1"
+# BlueBubbles webhook events are small JSON/form payloads; attachments come
+# through the REST API, not the webhook. 1 MiB is generous headroom while
+# keeping oversized/chunked bodies from being buffered unbounded.
+_WEBHOOK_MAX_BODY_BYTES = 1_048_576
 DEFAULT_WEBHOOK_PORT = 8645
 DEFAULT_WEBHOOK_PATH = "/bluebubbles-webhook"
 MAX_TEXT_LENGTH = 4000
@@ -242,7 +246,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.server_url or not self.password:
             logger.error(
                 "[bluebubbles] BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD are required"
@@ -274,7 +278,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 self.client = None
             return False
 
-        app = web.Application()
+        # Explicit body cap: BlueBubbles webhook events are small JSON (or
+        # form-encoded) payloads. client_max_size makes aiohttp enforce the
+        # cap on every read path — including chunked requests that carry no
+        # Content-Length (same pattern as webhook.py / raft, #58536/#58902).
+        app = web.Application(client_max_size=_WEBHOOK_MAX_BODY_BYTES)
         app.router.add_get("/health", lambda _: web.Response(text="ok"))
         app.router.add_post(self.webhook_path, self._handle_webhook)
         # The webhook auth value is carried in the query string because the
@@ -443,11 +451,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     ) -> Optional[str]:
         """Resolve an email/phone to a BlueBubbles chat GUID.
 
-        Resolution order:
+        Resolution order (homelab behavior, kept over upstream's
+        strict-match-only version — see homelab/PATCHES.md):
           1. Caller-provided raw GUID (contains ``;``) → return as-is.
           2. Cache hit on a previous resolution.
-          3. Query BB-server's chat list and match on ``chatIdentifier``
-             or any participant's ``address``.
+          3. Query BB-server's chat list and match strictly on
+             ``chatIdentifier`` / ``identifier`` (participant membership
+             is NOT used — a participant match could leak a DM reply
+             into a group thread, upstream #24157).
           4. Fall back to ``any;-;<handle>`` for phone/email handles.
              BB-server treats this as "1-on-1 chat with this handle,
              create if missing" (verified t3 fix on 2026-05-12). Without
@@ -470,7 +481,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         try:
             payload = await self._api_post(
                 "/api/v1/chat/query",
-                {"limit": 100, "offset": 0, "with": ["participants"]},
+                {"limit": 100, "offset": 0},
             )
             for chat in payload.get("data", []) or []:
                 guid = chat.get("guid") or chat.get("chatGuid")
@@ -481,12 +492,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                         while len(self._guid_cache) > _GUID_CACHE_SIZE:
                             self._guid_cache.popitem(last=False)
                     return guid
-                for part in chat.get("participants", []) or []:
-                    if (part.get("address") or "").strip() == target and guid:
-                        self._guid_cache[target] = guid
-                        while len(self._guid_cache) > _GUID_CACHE_SIZE:
-                            self._guid_cache.popitem(last=False)
-                        return guid
         except Exception:
             pass
         # Fallback (t3 fix, 2026-05-12): synthesize ``any;-;<handle>``

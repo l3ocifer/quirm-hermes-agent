@@ -35,8 +35,9 @@ export function StatusRow({
   return (
     <div
       className={cn(
-        'group/status-row flex min-h-6 items-center gap-2 rounded-md px-1.5 py-1 hover:bg-(--ui-row-hover-background)',
-        onActivate && 'cursor-pointer',
+        'group/status-row flex min-h-6 items-center gap-2 rounded-md px-1.5 py-1',
+        // row-hover bundles cursor:pointer — only when the row actually activates.
+        onActivate ? 'row-hover' : 'hover:bg-(--ui-row-hover-background)',
         className
       )}
       onClick={onActivate}
@@ -53,9 +54,7 @@ export function StatusRow({
       role={onActivate ? 'button' : undefined}
       tabIndex={onActivate ? 0 : undefined}
     >
-      {leading !== undefined && (
-        <span className="flex size-3.5 shrink-0 items-center justify-center">{leading}</span>
-      )}
+      {leading !== undefined && <span className="flex size-3.5 shrink-0 items-center justify-center">{leading}</span>}
       <div className="flex min-w-0 flex-1 items-center gap-2">{children}</div>
       {trailing && (
         <div
