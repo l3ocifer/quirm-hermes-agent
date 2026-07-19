@@ -37,6 +37,7 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
 from agent.error_classifier import FailoverReason
+from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -587,6 +588,10 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                     if prev_content and new_content
                     else (prev_content or new_content)
                 )
+                # Merged content invalidates the api_content sidecar (exact
+                # bytes previously sent for the pre-merge message) — drop it
+                # so replay can't substitute stale bytes.
+                drop_stale_api_content(prev)
                 repairs += 1
                 continue
         merged.append(msg)
@@ -643,16 +648,16 @@ def strip_think_blocks(agent, content: str) -> str:
     """Remove reasoning/thinking blocks from content, returning only visible text.
 
     Handles four cases:
-      1. Closed tag pairs (``<think>…</think>``) — the common path when
+      1. Closed tag pairs (`` <think>… ``) — the common path when
          the provider emits complete reasoning blocks.
       2. Unterminated open tag at a block boundary (start of text or
          after a newline) — e.g. MiniMax M2.7 / NIM endpoints where the
          closing tag is dropped.  Everything from the open tag to end
          of string is stripped.  The block-boundary check mirrors
          ``gateway/stream_consumer.py``'s filter so models that mention
-         ``<think>`` in prose aren't over-stripped.
+         `` <think>`` in prose aren't over-stripped.
       3. Stray orphan open/close tags that slip through.
-      4. Tag variants: ``<think>``, ``<thinking>``, ``<reasoning>``,
+      4. Tag variants: `` <think>``, ``<thinking>``, ``<reasoning>``,
          ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), all
          case-insensitive.
 
@@ -672,6 +677,39 @@ def strip_think_blocks(agent, content: str) -> str:
     """
     if not content:
         return ""
+    # Coerce non-string content to text before any regex runs.  Providers
+    # that return assistant ``content`` as a list of blocks (Anthropic via
+    # OpenRouter emits ``[{"type":"text",...}, {"type":"thinking",...}]``) or
+    # as a dict flow into this shared helper from several callers — most
+    # notably ``_interim_assistant_visible_text`` reading a *stored* history
+    # message whose content was persisted as a list.  A raw list/dict reaching
+    # ``re.sub`` below raises ``TypeError: expected string or bytes-like
+    # object, got 'list'``, which the outer conversation loop swallows and
+    # retries forever (observed as an infinite "preparing terminal…" loop on
+    # Anthropic models via OpenRouter).  Flatten here so every caller is safe.
+    if not isinstance(content, str):
+        if isinstance(content, list):
+            _parts: list[str] = []
+            for _part in content:
+                if isinstance(_part, str):
+                    _parts.append(_part)
+                elif isinstance(_part, dict):
+                    _ptype = str(_part.get("type") or "").strip().lower()
+                    # Drop reasoning/thinking blocks outright — this function's
+                    # whole job is to strip them, and their text lives under
+                    # different keys ("thinking", "reasoning") per provider.
+                    if _ptype in {"thinking", "reasoning", "redacted_thinking"}:
+                        continue
+                    _text = _part.get("text")
+                    if isinstance(_text, str) and _text:
+                        _parts.append(_text)
+            content = "".join(_parts)
+        elif isinstance(content, dict):
+            content = str(content.get("text") or content.get("content") or "")
+        else:
+            content = str(content)
+        if not content:
+            return ""
     # 1. Closed tag pairs — case-insensitive for all variants so
     #    mixed-case tags (<THINK>, <Thinking>) don't slip through to
     #    the unterminated-tag pass and take trailing content with them.

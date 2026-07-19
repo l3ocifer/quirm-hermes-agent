@@ -61,6 +61,7 @@ from hermes_cli.config import (
     get_config_path,
     get_env_path,
     get_hermes_home,
+    get_process_hermes_home,
     load_config,
     load_env,
     read_raw_config,
@@ -744,6 +745,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "Disable this on non-admin macOS accounts where /Applications is "
             "not writable."
         ),
+    },
+    "browser.headed": {
+        "type": "boolean",
+        "description": "Run the local browser in headed mode (visible window). Also keeps the window open between turns; idle sessions are still reaped after browser.inactivity_timeout.",
     },
 }
 
@@ -4257,6 +4262,139 @@ def get_profiles_sessions(
         "profile_totals": profile_totals,
         "limit": limit,
         "offset": offset,
+        "errors": errors,
+    }
+
+
+@app.get("/api/profiles/sessions/sidebar")
+def get_profiles_sessions_sidebar(
+    recents_profile: str = "all",
+    recents_limit: int = 20,
+    recents_exclude: str = None,
+    cron_limit: int = 50,
+    messaging_limit: int = 100,
+    messaging_exclude: str = None,
+):
+    """Batched sidebar session slices — one profile-DB open per refresh.
+
+    The desktop sidebar needs three source-scoped windows per refresh: recents
+    (local chats, scoped to the active profile), cron sessions (all profiles),
+    and messaging-platform sessions (all profiles). Served as three separate
+    ``/api/profiles/sessions`` calls they reopened every profile's ``state.db``
+    three times and re-counted each refresh. This opens each DB once and runs
+    the three filtered queries together, returning the three windows in one
+    payload. Read-only and process-light, same row projection and 300s active
+    heuristic as ``/api/profiles/sessions``.
+
+    The caller passes the source taxonomy (``recents_exclude`` /
+    ``messaging_exclude`` CSV, ``source=cron`` is implicit) so this stays
+    taxonomy-agnostic like the per-slice endpoint. All three slices use
+    ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
+    desktop's per-slice calls.
+    """
+    from hermes_state import SessionDB
+    from hermes_cli import profiles as profiles_mod
+
+    # cron + messaging are cross-profile; recents is scoped to recents_profile.
+    # Scan every profile once regardless (each DB opened a single time).
+    try:
+        infos = profiles_mod.list_profiles()
+        targets: List[Tuple[str, Path]] = [(info.name, info.path) for info in infos]
+    except Exception:
+        _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
+        targets = []
+    if not targets:
+        targets.append(("default", profiles_mod.get_profile_dir("default")))
+
+    recents_scope = (recents_profile or "all").strip() or "all"
+    recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
+    messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
+
+    recents_cap = min(max(recents_limit, 1), 500)
+    cron_cap = min(max(cron_limit, 1), 500)
+    messaging_cap = min(max(messaging_limit, 1), 500)
+
+    recents_rows: List[Dict[str, Any]] = []
+    cron_rows: List[Dict[str, Any]] = []
+    messaging_rows: List[Dict[str, Any]] = []
+    recents_total = 0
+    recents_profile_totals: Dict[str, int] = {}
+    errors: List[Dict[str, str]] = []
+    now = time.time()
+
+    def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:
+        for s in rows:
+            s["profile"] = name
+            s["is_default_profile"] = name == "default"
+            s["is_active"] = (
+                s.get("ended_at") is None
+                and (now - s.get("last_active", s.get("started_at", 0))) < 300
+            )
+            s["archived"] = bool(s.get("archived"))
+        return rows
+
+    def _slice(db, *, source=None, exclude=None, cap):
+        return db.list_sessions_rich(
+            source=source,
+            exclude_sources=exclude or None,
+            limit=cap,
+            offset=0,
+            min_message_count=1,
+            include_archived=False,
+            archived_only=False,
+            order_by_last_active=True,
+            compact_rows=True,
+        )
+
+    for name, home in targets:
+        db_path = Path(home) / "state.db"
+        if not db_path.exists():
+            continue
+        try:
+            db = SessionDB(db_path=db_path, read_only=True)
+        except Exception as exc:
+            errors.append({"profile": name, "error": str(exc)})
+            continue
+        try:
+            if recents_scope == "all" or name == recents_scope:
+                recents_rows.extend(
+                    _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
+                )
+                rtotal = db.session_count(
+                    exclude_sources=recents_exclude_list or None,
+                    min_message_count=1,
+                    include_archived=False,
+                    archived_only=False,
+                    exclude_children=True,
+                )
+                recents_total += rtotal
+                recents_profile_totals[name] = rtotal
+            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
+            messaging_rows.extend(
+                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
+            )
+        except Exception as exc:
+            errors.append({"profile": name, "error": str(exc)})
+        finally:
+            db.close()
+
+    def _window(rows: List[Dict[str, Any]], cap: int) -> List[Dict[str, Any]]:
+        rows.sort(key=lambda s: s.get("last_active") or s.get("started_at") or 0, reverse=True)
+        win = rows[:cap]
+        _strip_session_list_rows(win)
+        return win
+
+    return {
+        "recents": {
+            "sessions": _window(recents_rows, recents_cap),
+            "total": recents_total,
+            "profile_totals": recents_profile_totals,
+        },
+        "cron": {"sessions": _window(cron_rows, cron_cap)},
+        "messaging": {
+            "sessions": _window(messaging_rows, messaging_cap),
+            "total": len(messaging_rows),
+        },
         "errors": errors,
     }
 
@@ -15346,7 +15484,7 @@ def _resolve_chat_argv(
     dashboard's in-memory gateway runs under the dashboard's own profile,
     so a profile-scoped chat must spawn its own gateway subprocess.
     """
-    from hermes_cli.main import PROJECT_ROOT, _make_tui_argv
+    from hermes_cli.main import PROJECT_ROOT, _apply_tui_python_env, _make_tui_argv
 
     profile_dir: Optional[Path] = None
     requested = (profile or "").strip()
@@ -15360,6 +15498,7 @@ def _resolve_chat_argv(
         apply_terminal_config_to_env(env=env)
     except Exception:
         _log.debug("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
+    _apply_tui_python_env(env)
     env.setdefault("NODE_ENV", "production")
     # Browser-embedded chat should prefer stable wheel-based scrollback over
     # native terminal mouse tracking. When mouse tracking is enabled, wheel
@@ -16935,8 +17074,12 @@ def _discover_user_themes() -> list:
     Returns a list of fully-normalised theme definitions ready to ship
     to the frontend, so the client can apply them without a secondary
     round-trip or a built-in stub.
+
+    Uses the dashboard process launch home, not ``get_hermes_home()``, so a
+    transient profile override from embedded chat does not hide themes that
+    live under the server's own ``HERMES_HOME``.
     """
-    themes_dir = get_hermes_home() / "dashboard-themes"
+    themes_dir = get_process_hermes_home() / "dashboard-themes"
     if not themes_dir.is_dir():
         return []
     result = []
@@ -17097,8 +17240,12 @@ def _discover_dashboard_plugins() -> list:
 
     from hermes_cli.plugins import get_bundled_plugins_dir
     bundled_root = get_bundled_plugins_dir()
+    # User dashboard plugins are a dashboard-owned asset (same category as
+    # theme YAML): resolve them from the process launch home so they don't
+    # vanish when a request is scoped to another profile via a context-local
+    # HERMES_HOME override (e.g. embedded /chat under --open-profile).
     search_dirs = [
-        (get_hermes_home() / "plugins", "user"),
+        (get_process_hermes_home() / "plugins", "user"),
         (bundled_root / "memory", "bundled"),
         (bundled_root, "bundled"),
     ]
