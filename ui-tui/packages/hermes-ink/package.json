@@ -34,7 +34,7 @@
     "@alcalzone/ansi-tokenize": "^0.1.0",
     "auto-bind": "^5.0.0",
     "bidi-js": "^1.0.0",
-    "chalk": "^5.4.0",
+    "chalk": "^6.0.0",
     "cli-boxes": "^3.0.0",
     "code-excerpt": "^4.0.0",
     "emoji-regex": "^10.4.0",
