@@ -13,7 +13,8 @@ Track non-additive changes (anything outside `homelab/`).
   platform when `BLUEBUBBLES_SERVER_URL and BLUEBUBBLES_PASSWORD` are
   set; we widen the gate to also accept the proxy pair.
 - **Upstream PR**: not submitted (homelab-specific substrate).
-- **Last applied**: 2026-07-17 against upstream@226e8de.
+- **Last applied**: 2026-07-26 against upstream@fe431651c (clean merge,
+  no reapply needed).
 
 ### bluebubbles-guid-fallback: `any;-;<handle>` outbound chat creation
 
@@ -26,7 +27,8 @@ Track non-additive changes (anything outside `homelab/`).
   chatIdentifier-only matching (no participant fallback, #24157) is
   retained.
 - **Upstream PR**: not submitted.
-- **Last applied**: 2026-07-17 against upstream@226e8de.
+- **Last applied**: 2026-07-26 against upstream@fe431651c (clean merge,
+  no reapply needed).
 
 Quirm's own work — eval harness, benchmark scripts — lives in
 `quirm-graph/pages/`, not in source code.
