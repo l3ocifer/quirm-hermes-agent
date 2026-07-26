@@ -15,6 +15,7 @@ import {
   type SlashChipKind,
   slashIconElement
 } from '@/components/assistant-ui/directive-text'
+import { sessionRefFallbackLabel } from '@/lib/session-refs'
 
 export const RICH_INPUT_SLOT = 'composer-rich-input'
 
@@ -59,7 +60,9 @@ export function refChipHtml(kind: string, rawValue: string, displayLabel?: strin
   const id = unquoteRef(rawValue)
   const text = `@${kind}:${quoteRefValue(id)}`
 
-  return `<span contenteditable="false" data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}">${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(displayLabel || refLabel(id))}</span></span>`
+  const label = displayLabel || (kind === 'session' ? sessionRefFallbackLabel(id) : refLabel(id))
+
+  return `<span contenteditable="false" data-ref-text="${escapeHtml(text)}" data-ref-id="${escapeHtml(id)}" data-ref-kind="${escapeHtml(kind)}" class="${DIRECTIVE_CHIP_CLASS}">${directiveIconSvg(kind)}<span class="truncate">${escapeHtml(label)}</span></span>`
 }
 
 export function refChipElement(kind: string, rawValue: string, displayLabel?: string) {
@@ -74,7 +77,7 @@ export function refChipElement(kind: string, rawValue: string, displayLabel?: st
   chip.dataset.refKind = kind
   chip.className = DIRECTIVE_CHIP_CLASS
   label.className = 'truncate'
-  label.textContent = displayLabel || refLabel(id)
+  label.textContent = displayLabel || (kind === 'session' ? sessionRefFallbackLabel(id) : refLabel(id))
   chip.append(directiveIconElement(kind), label)
 
   return chip
@@ -359,5 +362,14 @@ export function normalizeComposerEditorDom(editor: HTMLElement) {
     if (!prev || (prev as HTMLElement).dataset?.refText) {
       editor.removeChild(last)
     }
+  }
+
+  // ContentEditable elements with no children can visually collapse to
+  // near-zero height in some browsers (especially Chromium), causing the
+  // composer to appear as a tiny dot/pixel. Ensure there's always at least
+  // one <br> so the element maintains intrinsic height. The CSS min-height
+  // is a belt; the <br> is suspenders — together they prevent the shrink.
+  if (editor.childNodes.length === 0) {
+    editor.appendChild(document.createElement('br'))
   }
 }
