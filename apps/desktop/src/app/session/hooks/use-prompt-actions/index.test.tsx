@@ -929,6 +929,51 @@ describe('usePromptActions slash.exec dispatch payloads', () => {
     vi.restoreAllMocks()
   })
 
+  it('executes /approvals against the focused profile session and persists its mode', async () => {
+    const focusedProfile = 'work'
+    const focusedSessionId = 'work-runtime-session'
+    const persistedModes = new Map<string, string>()
+    const sessionProfiles = new Map([[focusedSessionId, focusedProfile]])
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'slash.exec') {
+        const sessionId = String(params?.session_id ?? '')
+        const profile = sessionProfiles.get(sessionId)
+        const command = String(params?.command ?? '')
+
+        if (profile && command === 'approvals off') {
+          persistedModes.set(profile, 'off')
+        }
+
+        return { output: 'Approval mode: off (persistent profile setting).' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={focusedSessionId}
+        activeSessionIdRef={{ current: focusedSessionId }}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={focusedSessionId}
+      />
+    )
+
+    await handle!.submitText('/approvals off')
+
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'approvals off',
+      session_id: focusedSessionId
+    })
+    expect(persistedModes.get(focusedProfile)).toBe('off')
+    expect(persistedModes.has('default')).toBe(false)
+  })
+
   it('submits /goal send directives returned directly by slash.exec instead of rendering no output', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     const states: Record<string, unknown>[] = []
@@ -1510,6 +1555,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'queued message'
       },
@@ -1545,6 +1591,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: 'rt-session-a',
         text: 'queued for background session'
       },
@@ -1601,6 +1648,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: 'rt-session-a-rebound',
         text: 'queued for background session'
       },
@@ -1651,6 +1699,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(requestGateway).toHaveBeenCalledWith(
       'prompt.submit',
       {
+        queued: true,
         session_id: RUNTIME_SESSION_ID,
         text: 'please send me'
       },
@@ -2428,11 +2477,13 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(ok).toBe(true)
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[0]?.params).toEqual({
+      queued: true,
       session_id: 'rt-background-stale',
       text: 'queued background message after wake'
     })
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID, source: 'desktop' })
     expect(calls[2]?.params).toEqual({
+      queued: true,
       session_id: RECOVERED_SESSION_ID,
       text: 'queued background message after wake'
     })
