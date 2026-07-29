@@ -445,6 +445,7 @@ from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
+from hermes_cli.subcommands.approvals import build_approvals_parser
 from hermes_cli.subcommands.dump import build_dump_parser
 from hermes_cli.subcommands.debug import build_debug_parser
 from hermes_cli.subcommands.backup import build_backup_parser
@@ -1303,13 +1304,49 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
             return None
 
 
+def _resolve_workspace_key() -> Optional[str]:
+    """The current workspace identity for cwd-scoped resume.
+
+    Git repo root when CWD is inside a repo (so all sessions across its
+    subdirs/worktrees group together), else the CWD itself. Returns None when
+    neither can be determined — callers fall back to the global MRU then.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+
 def _resolve_last_session(source: str = "cli") -> Optional[str]:
-    """Look up the most recently-used session ID for a source."""
+    """Look up the most recently-used session ID for a source.
+
+    Scoped to the current workspace first (git repo root, else cwd) so
+    ``hermes -c`` from repo A continues repo A's last session rather than the
+    global MRU. Falls back to the unscoped MRU when no session matches the
+    current workspace, preserving the old behaviour for fresh directories.
+    """
     db = None
     try:
         from hermes_state import SessionDB
 
         db = SessionDB()
+        ws_key = _resolve_workspace_key()
+        if ws_key:
+            sessions = db.search_sessions(source=source, limit=1, workspace_key=ws_key)
+            if sessions:
+                return sessions[0]["id"]
+        # Fallback: global MRU for this source.
         sessions = db.search_sessions(source=source, limit=1)
         return sessions[0]["id"] if sessions else None
     except Exception:
@@ -4302,7 +4339,12 @@ def _prompt_reasoning_effort_selection(efforts, current_effort=""):
 
 
 
-def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
+def _prompt_api_key(
+    pconfig,
+    existing_key: str,
+    provider_id: str = "",
+    existing_source: str = "",
+) -> tuple:
     """Shared API-key entry point for ``hermes setup`` / ``hermes model``.
 
     Handles both first-time entry and the already-configured case.  When a key
@@ -4356,8 +4398,14 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         # Nothing we can rewrite; just acknowledge and move on.
         print()
         return existing_key, False
+    pool_backed = existing_source.startswith("credential_pool:")
+    menu = (
+        "  [K]eep / [R]eplace (default K): "
+        if pool_backed
+        else "  [K]eep / [R]eplace / [C]lear (default K): "
+    )
     try:
-        choice = input("  [K]eep / [R]eplace / [C]lear (default K): ").strip().lower()
+        choice = input(menu).strip().lower()
     except (KeyboardInterrupt, EOFError):
         print()
         choice = "k"
@@ -4373,7 +4421,7 @@ def _prompt_api_key(pconfig, existing_key: str, provider_id: str = "") -> tuple:
         print()
         return new_key, False
 
-    if choice.startswith("c"):
+    if choice.startswith("c") and not pool_backed:
         save_env_value(key_env, "")
         print(
             f"  API key cleared.  Re-run `hermes setup` to configure {pconfig.name} again."
@@ -4628,6 +4676,16 @@ def cmd_security(args):
     sys.exit(2)
 
 
+def cmd_approvals(args):
+    """Dispatch `hermes approvals <subcmd>`."""
+    from hermes_cli.approvals_suggest import approvals_command
+
+    status = approvals_command(args)
+    if status:
+        sys.exit(status)
+    return status
+
+
 def cmd_dump(args):
     """Dump setup summary for support/debugging."""
     from hermes_cli.dump import run_dump
@@ -4781,6 +4839,108 @@ def _clear_bytecode_cache(root: Path) -> int:
                 pass
             dirnames.clear()  # nothing left to recurse into
     return removed
+
+
+_UPDATE_RUNTIME_RELOAD_MODULES = (
+    "hermes_constants",
+    "tools.environments.local",
+    "tools.lazy_deps",
+)
+
+
+def _reload_updated_runtime_modules() -> None:
+    """Reload update-sensitive modules after the checkout changes in-place.
+
+    ``hermes update`` keeps running in the pre-pull Python process. After a
+    large update, modules already present in ``sys.modules`` can still expose
+    old symbols even though their source files on disk are new. Refresh the
+    small module set used by lazy-backend refresh before that step imports
+    newly-updated code paths.
+    """
+    try:
+        import importlib
+
+        importlib.invalidate_caches()
+        for module_name in _UPDATE_RUNTIME_RELOAD_MODULES:
+            module = sys.modules.get(module_name)
+            if module is None:
+                continue
+            try:
+                importlib.reload(module)
+            except Exception as exc:
+                logger.debug("Could not reload updated module %s: %s", module_name, exc)
+    except Exception as exc:
+        logger.debug("Could not refresh update runtime modules: %s", exc)
+
+
+# Stamp file recording the checkout fingerprint the bytecode cache was last
+# validated against. Lives next to the checkout (NOT in HERMES_HOME) because
+# __pycache__ is per-checkout state shared by every profile.
+_BYTECODE_FINGERPRINT_FILE = ".bytecode-fingerprint"
+
+
+def _record_bytecode_fingerprint() -> None:
+    """Persist the current checkout fingerprint after a bytecode sweep.
+
+    Never raises. A failed write just means the next launch re-sweeps —
+    safe, merely redundant.
+    """
+    try:
+        fingerprint = _read_git_revision_fingerprint(PROJECT_ROOT)
+        if not fingerprint:
+            return
+        stamp_path = PROJECT_ROOT / _BYTECODE_FINGERPRINT_FILE
+        tmp_path = stamp_path.with_name(stamp_path.name + ".tmp")
+        tmp_path.write_text(fingerprint, encoding="utf-8")
+        tmp_path.replace(stamp_path)
+    except OSError as exc:
+        logger.debug("Could not record bytecode fingerprint: %s", exc)
+
+
+def _sweep_stale_bytecode_if_checkout_changed() -> None:
+    """Clear ``__pycache__`` at launch when the checkout changed underneath us.
+
+    The stale-bytecode bug class (issues #6207, #60242; Dhruv's WhatsApp
+    ``cannot import name 'parse_model_flags_detailed'`` report) has one
+    shared shape: the checkout's ``.py`` files change (git pull inside
+    ``hermes update``, a manual ``git pull``, a ZIP update, a file-sync
+    restore) while ``__pycache__`` retains bytecode from the previous
+    revision, and a later process trusts the stale ``.pyc`` instead of the
+    fresh source.
+
+    Update-time clears alone can never close this class: ``hermes update``
+    always executes the PRE-pull updater code, so any hardening added to it
+    only takes effect one update late, and manual ``git pull`` never runs
+    the updater at all. This launch-time guard closes the loop: every
+    ``hermes`` entry point compares the checkout fingerprint (cheap file
+    reads, no git subprocess) against the last-validated stamp and sweeps
+    the bytecode cache once when they diverge.
+
+    Never raises — a failure here must not block launch.
+    """
+    try:
+        fingerprint = _read_git_revision_fingerprint(PROJECT_ROOT)
+        if not fingerprint:
+            return  # non-git install — the ZIP update path clears explicitly
+        stamp_path = PROJECT_ROOT / _BYTECODE_FINGERPRINT_FILE
+        try:
+            recorded = stamp_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        if recorded == fingerprint:
+            return
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            logger.info(
+                "Checkout changed since last launch (%s -> %s): cleared %d stale __pycache__ director%s",
+                recorded or "unknown",
+                fingerprint,
+                removed,
+                "y" if removed == 1 else "ies",
+            )
+        _record_bytecode_fingerprint()
+    except Exception as exc:
+        logger.debug("Stale-bytecode launch sweep failed: %s", exc)
 
 
 # Critical files that Hermes must be able to import immediately after an
@@ -5249,6 +5409,62 @@ def _run_npm_install_deterministic(
     )
 
 
+def _npm_bin_exists(bin_dir: Path, name: str) -> bool:
+    """True when an npm bin shim for *name* exists (POSIX or Windows)."""
+    return any(
+        (bin_dir / candidate).exists()
+        for candidate in (name, f"{name}.cmd", f"{name}.ps1", f"{name}.exe")
+    )
+
+
+def _web_build_toolchain_ready(*roots: Path) -> bool:
+    """True when ``tsc`` and ``vite`` shims are reachable from any of *roots*.
+
+    Callers must pass every root the build would search; checking only one
+    reports a healthy tree as broken.
+    """
+    bin_dirs = [
+        bin_dir
+        for bin_dir in (root / "node_modules" / ".bin" for root in roots)
+        if bin_dir.is_dir()
+    ]
+    return bool(bin_dirs) and all(
+        any(_npm_bin_exists(bin_dir, tool) for bin_dir in bin_dirs)
+        for tool in ("tsc", "vite")
+    )
+
+
+def _web_toolchain_roots(web_dir: Path) -> tuple[Path, ...]:
+    """Roots whose ``node_modules/.bin`` can satisfy the web build.
+
+    ``npm run build`` prepends ``node_modules/.bin`` for the package and each
+    of its ancestors, so shims hoisted to the workspace root and shims nested
+    under a package that owns its lockfile (#42973) are equally valid.
+    """
+    return (web_dir, web_dir.parent)
+
+
+def _missing_web_build_tool(output: str) -> str | None:
+    """Return the build tool a failed ``npm run build`` could not resolve.
+
+    Each shell words this differently: ``sh: 1: tsc: not found`` (dash),
+    ``vite: command not found`` (bash/zsh), and ``'tsc' is not recognized as
+    an internal or external command`` (cmd.exe).
+    """
+    lowered = output.lower()
+    for tool in ("tsc", "vite"):
+        if any(
+            phrase in lowered
+            for phrase in (
+                f"{tool}: not found",
+                f"{tool}: command not found",
+                f"'{tool}' is not recognized",
+            )
+        ):
+            return tool
+    return None
+
+
 def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """Build the web UI frontend if npm is available, serializing across processes.
 
@@ -5356,12 +5572,16 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     npm_workspace_args: tuple[str, ...] = () if npm_cwd == web_dir else ("--workspace", "web")
     if _is_termux_startup_environment():
         npm_cwd, npm_workspace_args = _termux_workspace_install_context(web_dir)
-    r1 = _run_npm_install_deterministic(
-        npm,
-        npm_cwd,
-        extra_args=(*npm_workspace_args, "--silent"),
-        env=build_env,
-    )
+
+    def _install_web_deps(*, silent: bool) -> "subprocess.CompletedProcess":
+        return _run_npm_install_deterministic(
+            npm,
+            npm_cwd,
+            extra_args=(*npm_workspace_args, "--silent") if silent else npm_workspace_args,
+            env=build_env,
+        )
+
+    r1 = _install_web_deps(silent=True)
     if r1.returncode != 0:
         _say(
             f"  {'✗' if fatal else '⚠'} Web UI npm install failed"
@@ -5378,11 +5598,22 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     # recoverable (the stale-dist fallback below handles the kill path).
     r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
     if r2.returncode != 0:
-        # Retry once after a short delay — covers boot-time races on Windows
-        # (antivirus scanning Node.js binaries, npm cache not ready, transient
-        # I/O when launched via Scheduled Task at logon). See issue #23817.
-        _time.sleep(3)
-        r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+        # The install above can exit 0 while leaving the tree without a build
+        # toolchain — a lockfile-hash skip over a half-installed tree, or an
+        # interrupted link step. The generic retry below just reruns the same
+        # command, so `tsc: not found` survives it and the stale dist is
+        # served forever. Reinstall (non-silent, so the user sees it) first.
+        missing_tool = _missing_web_build_tool((r2.stdout or "") + (r2.stderr or ""))
+        if missing_tool:
+            _say(f"  ⚠ Build could not resolve {missing_tool} — reinstalling web dependencies...")
+            _install_web_deps(silent=False)
+            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
+        if r2.returncode != 0:
+            # Retry once after a short delay — covers boot-time races on Windows
+            # (antivirus scanning Node.js binaries, npm cache not ready, transient
+            # I/O when launched via Scheduled Task at logon). See issue #23817.
+            _time.sleep(3)
+            r2 = _run_with_idle_timeout([npm, "run", "build"], cwd=web_dir, env=build_env)
 
     if r2.returncode != 0:
         # _run_with_idle_timeout merges stderr into stdout; older callers
@@ -6215,41 +6446,253 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path) -> list[int]:
     return stopped
 
 
-def _desktop_macos_relaunchable_fixup(desktop_dir: Path) -> None:
-    """Make a locally-built (unsigned) macOS desktop app survive in-place self-update.
+def _desktop_macos_bundle_id(bundle: Path) -> Optional[str]:
+    """Return a bundle/framework CFBundleIdentifier for local macOS signing."""
+    import plistlib
 
-    An ad-hoc-signed .app has no stable Designated Requirement (no Team ID), so
-    when the self-updater rebuilds the bundle in place with a fresh build (a new,
-    different cdhash) Gatekeeper/LaunchServices treats the changed code as
-    tampering and macOS reports "Hermes is damaged and can't be opened." The
-    bundle also inherits the com.apple.quarantine flag from the downloaded
-    installer process chain. Both make the relaunch fail.
+    info = bundle / "Contents" / "Info.plist"
+    if not info.exists() and bundle.suffix == ".framework":
+        candidates = list(bundle.glob("Versions/*/Resources/Info.plist")) + list(
+            bundle.glob("Resources/Info.plist")
+        )
+        if candidates:
+            info = candidates[0]
+    if not info.exists():
+        return None
+    try:
+        data = plistlib.loads(info.read_bytes())
+    except Exception:
+        return None
+    ident = data.get("CFBundleIdentifier")
+    return str(ident) if ident else None
 
-    Clearing the quarantine xattrs and re-applying a clean deep ad-hoc signature
-    (omitting the hardened-runtime flag, which is meaningless without a real
-    Developer ID) lets the rebuilt app relaunch. No-op when a real signing
-    identity is configured (CSC_LINK / APPLE_SIGNING_IDENTITY) so a properly
-    signed/notarized build is never clobbered. Best-effort: never raises.
+
+def _desktop_macos_local_signing_identity() -> Optional[str]:
+    """Return the opt-in keychain identity for local macOS desktop signing.
+
+    ``desktop.macos_signing_identity`` in config.yaml names a persistent
+    code-signing certificate in the user's login keychain (a self-signed
+    "Code Signing" cert made in Keychain Access is enough — no Apple Developer
+    account needed). Signing with any identity gives the app a
+    certificate-anchored Designated Requirement, which is the strongest way to
+    keep macOS TCC grants (Full Disk Access, Accessibility, Automation, Files
+    and Folders) stable across local rebuilds. Empty/unset keeps the default
+    identifier-pinned ad-hoc signing.
     """
     if sys.platform != "darwin":
-        return
-    if os.environ.get("CSC_LINK") or os.environ.get("APPLE_SIGNING_IDENTITY"):
-        return
+        return None
+    try:
+        from hermes_cli.config import load_config
+
+        desktop = load_config().get("desktop", {})
+        if not isinstance(desktop, dict):
+            return None
+        identity = desktop.get("macos_signing_identity")
+        if not isinstance(identity, str):
+            return None
+        return identity.strip() or None
+    except Exception as exc:
+        print(
+            "  (warning: could not load desktop.macos_signing_identity: "
+            f"{exc}; falling back to ad-hoc signing)"
+        )
+        return None
+
+
+def _desktop_macos_has_valid_real_signature(app: Path) -> bool:
+    """True when the bundle carries an intact non-ad-hoc (Team ID) signature.
+
+    Used to make the relaunch fixup a no-op on properly signed/notarized
+    builds even when CSC_LINK / APPLE_SIGNING_IDENTITY aren't in the
+    environment (e.g. a release DMG install being repaired) — clobbering a
+    Developer ID signature with an ad-hoc one would reset TCC grants and can
+    break the hardened runtime. A *stale* real signature (in-place rebuild
+    tampered with the bundle) fails --verify and returns False so the fixup
+    can repair it.
+    """
+    codesign = shutil.which("codesign")
+    if not codesign:
+        return False
+    try:
+        info = subprocess.run(
+            [codesign, "-dv", str(app)], check=False, capture_output=True, text=True
+        )
+        output = f"{info.stdout}\n{info.stderr}"
+        if info.returncode != 0 or "TeamIdentifier=" not in output \
+                or "TeamIdentifier=not set" in output:
+            return False
+        verify = subprocess.run(
+            [codesign, "--verify", "--deep", "--strict", str(app)],
+            check=False, capture_output=True,
+        )
+        return verify.returncode == 0
+    except Exception:
+        return False
+
+
+def _desktop_macos_local_codesign(
+    app: Path, *, desktop_dir: Path, identity: str = "-"
+) -> bool:
+    """Re-sign a local Desktop build so macOS TCC grants survive rebuilds.
+
+    A plain ``codesign --deep --sign -`` leaves the bundle with a cdhash-only
+    Designated Requirement and strips electron-builder's entitlements. Every
+    rebuild changes the cdhash, so TCC (Full Disk Access, Accessibility,
+    Automation, Files and Folders: Desktop/Downloads/Documents, microphone)
+    treats the rebuilt app as different code and the user must re-grant
+    everything — and the lost entitlements break microphone/JIT under the
+    hardened runtime.
+
+    Instead, sign inside-out (standalone Mach-O binaries, then nested
+    frameworks/helper apps, then the main bundle), preserving the repo's
+    entitlement plists, and pin an explicit identifier-based Designated
+    Requirement when signing ad-hoc. With a real ``identity`` the certificate
+    anchors the DR, so no explicit requirement is needed. Raises on signing
+    failure; returns True after strict verification passes.
+    """
+    codesign = shutil.which("codesign")
+    if not codesign:
+        return False
+
+    ent_main = desktop_dir / "electron" / "entitlements.mac.plist"
+    ent_inherit = desktop_dir / "electron" / "entitlements.mac.inherit.plist"
+    if not (ent_main.exists() and ent_inherit.exists()):
+        # Hardened-runtime restrictions are enforced even for ad-hoc
+        # signatures. Signing with --options runtime but WITHOUT the allow-jit
+        # entitlements would leave Electron/V8 crashing on launch — strictly
+        # worse than the legacy plain ad-hoc sign. Bail out so the caller
+        # falls back to that legacy path instead.
+        raise FileNotFoundError(
+            f"desktop entitlement plists missing under {desktop_dir / 'electron'}"
+        )
+
+    def sign_path(
+        path: Path,
+        *,
+        entitlements: Optional[Path] = None,
+        identifier: Optional[str] = None,
+        runtime: bool = True,
+    ) -> None:
+        args = [codesign, "--force", "--sign", identity, "--timestamp=none"]
+        if runtime:
+            args += ["--options", "runtime"]
+        if entitlements is not None and entitlements.exists():
+            args += ["--entitlements", str(entitlements)]
+        if identifier and identity == "-":
+            # Ad-hoc signatures get a cdhash-only DR by default; pin an
+            # identifier-based DR so TCC has something stable to persist.
+            args += ["--requirements", f'=designated => identifier "{identifier}"']
+        args.append(str(path))
+        subprocess.run(args, check=True, capture_output=True)
+
+    # 1) Standalone Mach-O files (native modules, dylibs, crashpad handler).
+    #    Compare paths relative to the app root — the absolute path always
+    #    contains the outer Hermes.app component, so an absolute-parts check
+    #    would skip every file.
+    contents = app / "Contents"
+    standalone: list[Path] = []
+    for root, _dirs, files in os.walk(contents):
+        root_path = Path(root)
+        rel_parts = root_path.relative_to(app).parts
+        if any(part.endswith(".app") for part in rel_parts):
+            continue  # nested helper apps are signed as bundles below
+        for name in files:
+            fp = root_path / name
+            if name in {"chrome_crashpad_handler", "spawn-helper"} or fp.suffix in {
+                ".node",
+                ".dylib",
+            }:
+                standalone.append(fp)
+    for fp in sorted(standalone, key=lambda p: len(p.parts), reverse=True):
+        sign_path(fp, runtime=False)
+
+    # 2) Nested frameworks and helper apps, deepest first.
+    bundles: list[Path] = []
+    frameworks_dir = contents / "Frameworks"
+    if frameworks_dir.exists():
+        for root, _dirs, _files in os.walk(frameworks_dir):
+            p = Path(root)
+            if p.suffix in {".framework", ".app"}:
+                bundles.append(p)
+    for bundle in sorted(set(bundles), key=lambda p: len(p.parts), reverse=True):
+        ent = ent_inherit if bundle.suffix == ".app" and "Helper" in bundle.name else None
+        sign_path(bundle, entitlements=ent, identifier=_desktop_macos_bundle_id(bundle))
+
+    # 3) The main bundle, with the app's own entitlements.
+    sign_path(app, entitlements=ent_main, identifier=_desktop_macos_bundle_id(app))
+    subprocess.run(
+        [codesign, "--verify", "--deep", "--strict", str(app)],
+        check=True, capture_output=True,
+    )
+    return True
+
+
+def _desktop_macos_relaunchable_fixup(
+    desktop_dir: Path,
+    *,
+    publisher_signing_configured: Optional[bool] = None,
+) -> bool:
+    """Make a locally-built macOS desktop app survive in-place self-update
+    without resetting the user's TCC permission grants.
+
+    An ad-hoc-signed .app has no stable Designated Requirement, so when the
+    self-updater rebuilds the bundle in place (new cdhash) Gatekeeper reports
+    "Hermes is damaged and can't be opened" — and macOS TCC forgets every
+    permission the user granted (Full Disk Access, Desktop/Downloads/Documents,
+    Accessibility, Automation, microphone), re-prompting on every launch after
+    every update.
+
+    Clear the quarantine xattrs, then re-sign with a stable identity:
+    ``desktop.macos_signing_identity`` (a persistent keychain cert — strongest)
+    when configured, else ad-hoc with identifier-pinned Designated Requirements,
+    preserving the repo's entitlement plists either way. No-op when a real
+    publisher identity is configured (CSC_LINK / APPLE_SIGNING_IDENTITY) or the
+    bundle already carries an intact Developer ID signature, so a properly
+    signed/notarized build is never clobbered. Callers that already made the
+    publisher-signing decision may pass it explicitly so a later dotenv load
+    can't reverse it. Falls back to the legacy deep ad-hoc sign if the
+    entitlement-preserving path fails. Best-effort: never raises. Returns True
+    when no work was needed or signing + strict verification succeeded.
+    """
+    if sys.platform != "darwin":
+        return True
+    if publisher_signing_configured is None:
+        publisher_signing_configured = bool(
+            os.environ.get("CSC_LINK") or os.environ.get("APPLE_SIGNING_IDENTITY")
+        )
+    if publisher_signing_configured:
+        return True
     exe = _desktop_packaged_executable(desktop_dir)
     if exe is None:
-        return
+        return True
     # exe = .../Hermes.app/Contents/MacOS/Hermes  ->  app bundle = .../Hermes.app
     app = exe.parents[2]
     if not str(app).endswith(".app") or not app.is_dir():
-        return
+        return True
     codesign = shutil.which("codesign")
     if not codesign:
-        return
+        return False
+    if _desktop_macos_has_valid_real_signature(app):
+        return True
+    subprocess.run(["xattr", "-cr", str(app)], check=False)
+    identity = _desktop_macos_local_signing_identity() or "-"
     try:
-        subprocess.run(["xattr", "-cr", str(app)], check=False)
+        if _desktop_macos_local_codesign(app, desktop_dir=desktop_dir, identity=identity):
+            label = "keychain identity" if identity != "-" else "stable ad-hoc identity"
+            print(f"  → macOS desktop signed with {label}; TCC grants persist across rebuilds")
+            return True
+    except Exception as exc:
+        if identity != "-":
+            print(
+                f"  (warning: configured macOS signing identity failed: {identity!r}; "
+                "falling back to ad-hoc — TCC grants may need to be re-granted)"
+            )
+        print(f"  (warning: stable macOS signing failed ({exc}); using legacy ad-hoc sign)")
+    try:
         subprocess.run([codesign, "--force", "--deep", "--sign", "-", str(app)], check=False)
     except Exception as exc:
         print(f"  (warning: macOS relaunch fixup skipped: {exc})")
+    return False
 
 
 def _force_adhoc_macos_signing(env: dict, *, source_mode: bool) -> bool:
@@ -6641,11 +7084,11 @@ def cmd_gui(args: argparse.Namespace):
     sys.exit(launch_result.returncode)
 
 
-def _find_stale_dashboard_pids(
+def _scan_dashboard_processes(
     *,
     exclude_pids: set[int] | None = None,
-) -> list[int]:
-    """Return PIDs of ``hermes dashboard`` processes other than ourselves.
+) -> list[tuple[int, str]]:
+    """Return matching ``dashboard``/``serve`` processes with their cmdlines.
 
     ``hermes dashboard`` is a long-lived server process commonly started and
     forgotten.  When ``hermes update`` replaces files on disk, the running
@@ -6681,7 +7124,7 @@ def _find_stale_dashboard_pids(
         "hermes_cli/main.py serve",
     ]
     self_pid = os.getpid()
-    dashboard_pids: list[int] = []
+    dashboard_processes: list[tuple[int, str]] = []
 
     try:
         if sys.platform == "win32":
@@ -6720,7 +7163,7 @@ def _find_stale_dashboard_pids(
                         and int(pid_str) != self_pid
                     ):
                         try:
-                            dashboard_pids.append(int(pid_str))
+                            dashboard_processes.append((int(pid_str), current_cmd))
                         except ValueError:
                             pass
         else:
@@ -6750,13 +7193,72 @@ def _find_stale_dashboard_pids(
                         continue
                     command = parts[1]
                     if any(p in command for p in patterns) and pid != self_pid:
-                        dashboard_pids.append(pid)
+                        dashboard_processes.append((pid, command))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
 
     if exclude_pids:
-        dashboard_pids = [p for p in dashboard_pids if p not in exclude_pids]
-    return dashboard_pids
+        dashboard_processes = [
+            proc for proc in dashboard_processes if proc[0] not in exclude_pids
+        ]
+    return dashboard_processes
+
+
+def _find_stale_dashboard_pids(
+    *,
+    exclude_pids: set[int] | None = None,
+) -> list[int]:
+    """Return PIDs of stale ``dashboard``/``serve`` processes for update cleanup."""
+    return [pid for pid, _cmd in _scan_dashboard_processes(exclude_pids=exclude_pids)]
+
+
+def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
+    """Best-effort parse of a dashboard/server cmdline into mode, host, and port."""
+    mode = None
+    if any(
+        pattern in command
+        for pattern in (
+            "hermes dashboard",
+            "hermes_cli.main dashboard",
+            "hermes_cli/main.py dashboard",
+        )
+    ):
+        mode = "dashboard"
+    elif any(
+        pattern in command
+        for pattern in (
+            "hermes serve",
+            "hermes_cli.main serve",
+            "hermes_cli/main.py serve",
+        )
+    ):
+        mode = "serve"
+    if mode is None:
+        return None
+
+    port = 9119
+    host = "127.0.0.1"
+
+    port_match = re.search(r"(?:^|\s)--port(?:=|\s+)(\d+)", command)
+    if port_match:
+        try:
+            port = int(port_match.group(1))
+        except ValueError:
+            return None
+
+    host_match = re.search(r"(?:^|\s)--host(?:=|\s+)(\"[^\"]+\"|'[^']+'|\S+)", command)
+    if host_match:
+        host = host_match.group(1).strip("\"'") or "127.0.0.1"
+
+    return mode, host, port
+
+
+def _dashboard_probe_host(host: str | None) -> str:
+    """Map wildcard binds to a loopback address suitable for local probing."""
+    normalized = (host or "127.0.0.1").strip().strip("[]")
+    if normalized in {"", "0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return normalized
 
 
 def _print_curator_first_run_notice() -> None:
@@ -7111,12 +7613,205 @@ def _restart_managed_dashboard_service(
     return True
 
 
+def _get_systemd_service_for_pid(pid: int) -> str | None:
+    """If *pid* belongs to a systemd service unit, return the unit name.
+
+    Reads ``/proc/<pid>/cgroup`` and extracts the service name (e.g.
+    ``hermes-serve.service``).  Returns ``None`` when the PID is not
+    part of a systemd service, when the file is unreadable, or on
+    non-Linux platforms.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            # Format: 0::/system.slice/hermes-serve.service
+            #         0::/user.slice/user-1000.slice/session-42.scope
+            parts = line.split("::", 1)
+            if len(parts) != 2:
+                continue
+            cg_path = parts[1]
+            if cg_path.endswith(".service"):
+                svc_name = cg_path.rsplit("/", 1)[-1]
+                if svc_name:
+                    return svc_name
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _extract_scope_from_cgroup(cgroup_entry: str) -> str | None:
+    """Extract the systemd scope (``user`` or ``system``) from a cgroup path.
+
+    The cgroup path format is ``/system.slice/<name>.service`` for system
+    services and ``/user.slice/user-<uid>.slice/<name>.service`` for user
+    services.  Returns ``None`` when the scope cannot be determined.
+    """
+    if "/system.slice/" in cgroup_entry:
+        return "system"
+    if "/user.slice/" in cgroup_entry:
+        return "user"
+    return None
+
+
+def _get_pid_cgroup_path(pid: int) -> str | None:
+    """Return the cgroup path from ``/proc/<pid>/cgroup``, or ``None``.
+
+    Only the unified (``0::``) hierarchy cgroup entry is examined.
+    """
+    try:
+        cgroup_path = Path(f"/proc/{pid}/cgroup")
+        if not cgroup_path.is_file():
+            return None
+        text = cgroup_path.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            parts = line.split("::", 1)
+            if len(parts) == 2:
+                return parts[1]
+    except (OSError, PermissionError):
+        pass
+    return None
+
+
+def _try_restart_systemd_service(svc_name: str, cgroup_path: str | None = None) -> bool:
+    """Attempt to restart *svc_name* via systemctl.
+
+    Uses ``systemctl --user`` for user-scope services and ``systemctl``
+    for system-scope services.  Returns ``True`` on success.
+    """
+    scope = _extract_scope_from_cgroup(cgroup_path) if cgroup_path else None
+    if scope == "user":
+        cmd = ["systemctl", "--user", "restart", svc_name]
+    elif scope == "system":
+        cmd = ["systemctl", "restart", svc_name]
+    else:
+        # Unknown scope — try system first, then user
+        cmd = None
+        for candidate in (
+            ["systemctl", "restart", svc_name],
+            ["systemctl", "--user", "restart", svc_name],
+        ):
+            try:
+                r = subprocess.run(
+                    candidate,
+                    capture_output=True,
+                    text=True, encoding="utf-8", errors="replace",
+                    timeout=15,
+                )
+                if r.returncode == 0:
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                continue
+        return False
+
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=15,
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return False
+
+
+def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
+    """Return the exact argv of a running process, when recoverable.
+
+    Linux: reads ``/proc/<pid>/cmdline`` (NUL-separated, lossless).
+    macOS: falls back to ``ps -o command=`` + shlex (best effort — quoting
+    is reconstructed, but hermes launch commands don't embed exotic args).
+    Windows: returns ``None``; taskkill /F gives no graceful window and the
+    desktop app manages its own backend there.
+    """
+    if sys.platform == "win32":
+        return None
+    try:
+        cmdline_path = f"/proc/{pid}/cmdline"
+        if os.path.exists(cmdline_path):
+            with open(cmdline_path, "rb") as f:
+                raw = f.read()
+            argv = [
+                part.decode("utf-8", errors="replace")
+                for part in raw.split(b"\x00")
+                if part
+            ]
+            return argv or None
+        # macOS (no /proc): best-effort via ps.
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        command = (result.stdout or "").strip()
+        if not command:
+            return None
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = command.split()
+        return argv or None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def _respawn_dashboard_processes(commands: list[list[str]]) -> list[list[str]]:
+    """Best-effort respawn of manually-started dashboards after ``hermes update``.
+
+    Spawns each recovered argv detached (new session, output to the profile's
+    ``logs/dashboard-restart.log``).  Returns the commands that failed to
+    spawn; the caller prints the manual hint for those.
+    """
+    from hermes_constants import get_hermes_home
+
+    respawned: list[list[str]] = []
+    failed: list[tuple[list[str], str]] = []
+    log_path = get_hermes_home() / "logs" / "dashboard-restart.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    for command in commands:
+        try:
+            # Keep restarted dashboards headless; reopening a browser after a
+            # background update is noisy and fails in SSH/headless sessions.
+            if "dashboard" in command and "--no-open" not in command:
+                command = [*command, "--no-open"]
+            with open(log_path, "ab") as log_f:
+                subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            respawned.append(command)
+        except (OSError, ValueError) as exc:
+            failed.append((command, str(exc)))
+
+    for command in respawned:
+        print(f"    ✓ restarted: {shlex.join(command)}")
+    for command, err_msg in failed:
+        print(f"    ✗ failed to restart ({shlex.join(command)}): {err_msg}")
+    return [command for command, _ in failed]
+
+
 def _kill_stale_dashboard_processes(
     reason: str = "the running backend no longer matches the updated frontend",
     *,
     restart_managed: bool = False,
-) -> None:
-    """Kill running ``hermes dashboard`` processes.
+) -> dict[str, list]:
+    """Kill running ``hermes dashboard`` / ``hermes serve`` processes.
 
     Called at the end of ``hermes update`` (default ``reason``) and also
     from ``hermes dashboard --stop`` (which overrides ``reason``).  The
@@ -7133,11 +7828,14 @@ def _kill_stale_dashboard_processes(
     Manually-started dashboards are not auto-restarted because we don't know
     the original launch args (--host, --port, --insecure, --tui, --no-open).
     When ``restart_managed`` is true (the ``hermes update`` path), a detected
-    ``hermes-dashboard.service`` is restarted through systemd instead of
-    raw-killing its main PID.
+    ``hermes-dashboard.service`` is restarted through systemd; any OTHER
+    killed PID that was supervised by a systemd unit (custom unit names —
+    e.g. a remote backend's ``hermes-serve.service``) has its owning unit
+    restarted after the kill, because systemd treats our SIGTERM as a clean
+    stop and ``Restart=on-failure`` would never fire (#68934).
     """
     if restart_managed and _restart_managed_dashboard_service(reason):
-        return
+        return {"matched": [], "killed": [], "failed": []}
 
     # When the Hermes Desktop Electron app spawns this dashboard as a
     # backend child, it sets HERMES_DESKTOP_CHILD_PID so that the update
@@ -7161,10 +7859,30 @@ def _kill_stale_dashboard_processes(
 
     pids = _find_stale_dashboard_pids(exclude_pids=exclude)
     if not pids:
-        return
+        return {"matched": [], "killed": [], "failed": []}
 
     print()
     print(f"⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
+
+    # Before killing, snapshot systemd cgroup info for each PID so we can
+    # restart supervised services after the kill (the cgroup disappears
+    # along with the process).  Only meaningful on Linux, and only when the
+    # caller asked for restarts (the `hermes update` path) — `--stop` must
+    # stay a stop, not a restart.
+    pid_cgroup: dict[int, str | None] = {}
+    pid_service: dict[int, str | None] = {}
+    pid_cmdline: dict[int, list[str]] = {}
+    if restart_managed and sys.platform != "win32":
+        for pid in pids:
+            cg_path = _get_pid_cgroup_path(pid)
+            pid_cgroup[pid] = cg_path
+            pid_service[pid] = _get_systemd_service_for_pid(pid)
+            if not pid_service[pid]:
+                # Manually-started process: preserve its exact argv so we
+                # can respawn it after the update (#40449, #68934).
+                cmdline = _dashboard_cmdline_for_pid(pid)
+                if cmdline:
+                    pid_cmdline[pid] = cmdline
 
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
@@ -7232,9 +7950,79 @@ def _kill_stale_dashboard_processes(
     for pid, err_msg in failed:
         print(f"    ✗ failed to stop PID {pid}: {err_msg}")
 
-    if killed:
+    # Restart what we just killed (update path only).  Two categories:
+    #  - systemd-supervised PIDs: restart the owning unit.  Without this, a
+    #    remote backend (hermes serve) under Restart=on-failure never comes
+    #    back after our clean SIGTERM, and the Desktop can't reconnect (#68934).
+    #  - manually-started PIDs: respawn the argv captured before the kill
+    #    (#40449) — detached, headless, logged to logs/dashboard-restart.log.
+    restarted_services: list[str] = []
+    unrecovered: list[int] = []
+    if killed and restart_managed:
+        failed_restarts: list[tuple[str, str]] = []
+        seen_services: set[str] = set()
+        respawn_cmds: list[list[str]] = []
+        for pid in killed:
+            svc_name = pid_service.get(pid)
+            if svc_name:
+                if svc_name in seen_services:
+                    continue
+                seen_services.add(svc_name)
+                if _try_restart_systemd_service(svc_name, pid_cgroup.get(pid)):
+                    restarted_services.append(svc_name)
+                else:
+                    failed_restarts.append((svc_name, "systemctl restart returned non-zero"))
+                    unrecovered.append(pid)
+            elif pid in pid_cmdline:
+                respawn_cmds.append(pid_cmdline[pid])
+            else:
+                unrecovered.append(pid)
+
+        for svc in restarted_services:
+            print(f"    ✓ restarted systemd service {svc}")
+        for svc, err in failed_restarts:
+            print(f"    ⚠ {svc}: {err}")
+
+        if respawn_cmds:
+            failed_cmds = _respawn_dashboard_processes(respawn_cmds)
+            if failed_cmds:
+                unrecovered.extend(p for p in killed if pid_cmdline.get(p) in failed_cmds)
+
+        if failed_restarts or unrecovered:
+            print("  Restart anything not auto-restarted when you're ready:")
+            print("    hermes dashboard --port <port>")
+    elif killed:
+        unrecovered = list(killed)
         print("  Restart the dashboard when you're ready:")
         print("    hermes dashboard --port <port>")
+
+    return {
+        "matched": list(pids),
+        "killed": list(killed),
+        "failed": list(failed),
+        "unrecovered": list(unrecovered),
+    }
+
+
+def _finish_dashboard_update_cleanup(node_failures: list[str]) -> None:
+    """Refresh managed dashboards or stop stale manual ones after an update."""
+    if node_failures:
+        print()
+        print("  ℹ Leaving running dashboard process(es) untouched because the")
+        print("    Node.js dependency refresh did not complete.")
+        return
+
+    stop_result = _kill_stale_dashboard_processes(restart_managed=True)
+    if not stop_result.get("unrecovered"):
+        return
+
+    print()
+    print(
+        "⚠ A web dashboard/serve process was stopped during update and could "
+        "not be auto-restarted."
+    )
+    print("  Re-launch it when you want the web UI back:")
+    print("    hermes dashboard --port <port>")
 
 
 # Back-compat alias: some tests and any external callers may import the old
@@ -7385,6 +8173,7 @@ def _update_via_zip(args):
         print(
             f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
         )
+    _record_bytecode_fingerprint()
 
     # Reinstall Python dependencies. Prefer .[all], but if one optional extra
     # breaks on this machine, keep base deps and reinstall the remaining extras
@@ -7426,6 +8215,11 @@ def _update_via_zip(args):
                 check=True,
             )
         _install_python_dependencies_with_optional_fallback(pip_cmd)
+
+    # ZIP path parity: heal the active memory provider's bridge packages
+    # after the dependency reinstall, same as the git-pull path (#53272,
+    # #70636).
+    _refresh_active_memory_provider_dependencies()
 
     node_failures = _update_node_dependencies()
     _build_web_ui(PROJECT_ROOT / "web")
@@ -7550,12 +8344,7 @@ def _update_via_zip(args):
         logger.debug("Curator recent-run notice failed: %s", e)
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
-    if node_failures:
-        print()
-        print("  ℹ Leaving running dashboard process(es) untouched because the")
-        print("    Node.js dependency refresh did not complete.")
-    else:
-        _kill_stale_dashboard_processes(restart_managed=True)
+    _finish_dashboard_update_cleanup(node_failures)
 
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
@@ -9260,6 +10049,55 @@ def _refresh_active_lazy_features(
     return False
 
 
+def _refresh_active_memory_provider_dependencies() -> None:
+    """Refresh pip dependencies for the configured external memory provider.
+
+    Memory-provider bridge packages are declared in each provider's
+    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
+    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
+    or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
+    provider's declared install for the ACTIVE provider only, after the
+    core install and lazy refresh, so the last write to any shared package
+    is the one the active provider needs.
+
+    Never raises. A failure here must not block the rest of the update.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (config load failed): %s", exc)
+        return
+
+    provider = ""
+    if isinstance(cfg, dict):
+        memory_cfg = cfg.get("memory")
+        if isinstance(memory_cfg, dict):
+            if memory_cfg.get("enabled") is False:
+                return
+            provider = str(memory_cfg.get("provider") or "").strip()
+
+    # "default" / empty is the built-in file-backed store — no pip deps.
+    if not provider or provider in {"default", "builtin", "none"}:
+        return
+
+    try:
+        from hermes_cli.memory_setup import _install_dependencies
+    except Exception as exc:
+        logger.debug("Memory provider refresh skipped (import failed): %s", exc)
+        return
+
+    print()
+    print(f"→ Refreshing active memory provider dependencies ({provider})...")
+
+    try:
+        _install_dependencies(provider, force=True)
+    except Exception as exc:
+        print(f"  ⚠ {provider} dependencies failed to refresh: {exc}")
+
+
 def _install_python_dependencies_with_optional_fallback(
     install_cmd_prefix: list[str],
     *,
@@ -9768,6 +10606,15 @@ def _npm_lockfile_changed(hermes_root: Path) -> bool:
     # Also check that node_modules exists; a matching hash with missing
     # node_modules means the cache was recorded by another checkout.
     if not (PROJECT_ROOT / "node_modules").is_dir():
+        return True
+    # A matching lockfile hash over a tree whose web build toolchain never
+    # landed must NOT skip the reinstall — otherwise every later `hermes
+    # update` keeps rebuilding against a half-installed tree and serving a
+    # stale dist.
+    web_dir = PROJECT_ROOT / "web"
+    if (web_dir / "package.json").is_file() and not _web_build_toolchain_ready(
+        *_web_toolchain_roots(web_dir)
+    ):
         return True
     try:
         # Key the cache by PROJECT_ROOT so parallel worktrees don't collide.
@@ -10430,6 +11277,54 @@ def _ensure_fhs_path_guard() -> None:
         wrote_any = True
     if wrote_any:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
+
+
+def _ensure_acp_launcher() -> None:
+    """Self-heal: install a ``hermes-acp`` launcher next to the ``hermes`` one.
+
+    Mirrors the launcher block in ``scripts/install.sh`` so existing installs
+    gain the ACP command on ``hermes update`` without a reinstall.  ACP hosts
+    (Zed, JetBrains, Buzz Desktop) spawn the agent by resolving the
+    ``hermes-acp`` command name against the login-shell PATH; the console
+    script of that name lives inside the install's venv, which is not on that
+    PATH, so those hosts report Hermes as not installed even when it is.
+
+    The shim simply delegates to the sibling ``hermes`` launcher with the
+    ``acp`` subcommand, which makes it correct for every install layout
+    (venv wrapper, FHS symlink, pipx/pip console script) without having to
+    reconstruct interpreter/entrypoint paths.
+
+    No-op on Windows (install.ps1 puts ``venv\\Scripts`` on the user PATH, so
+    ``hermes-acp.exe`` already resolves) and wherever a ``hermes-acp`` is
+    already present next to the ``hermes`` command.  Unwritable directories
+    (e.g. ``/usr/local/bin`` as non-root) are skipped silently.  Idempotent.
+    """
+    if sys.platform == "win32":
+        return
+    for bin_dir in (Path.home() / ".local" / "bin", Path("/usr/local/bin")):
+        hermes_cmd = bin_dir / "hermes"
+        acp_cmd = bin_dir / "hermes-acp"
+        try:
+            if not (hermes_cmd.is_file() or hermes_cmd.is_symlink()):
+                continue
+            # Already present — a console script (pip/pipx install), an
+            # earlier shim, or a symlink. is_symlink() catches broken
+            # symlinks that exists() would miss; never follow-and-overwrite
+            # (the #21454 failure mode).
+            if acp_cmd.exists() or acp_cmd.is_symlink():
+                continue
+            shim = (
+                "#!/usr/bin/env bash\n"
+                "# Hermes Agent — ACP launcher (written by `hermes update`).\n"
+                "# ACP hosts (Zed, JetBrains, Buzz) resolve the agent by this\n"
+                "# command name on the login-shell PATH.\n"
+                f'exec "{hermes_cmd}" acp "$@"\n'
+            )
+            acp_cmd.write_text(shim, encoding="utf-8")
+            acp_cmd.chmod(acp_cmd.stat().st_mode | 0o755)
+        except OSError:
+            continue
+        print(f"  ✓ Installed hermes-acp launcher → {acp_cmd}")
 
 
 def _size_delta_label(saved_mb: float) -> str:
@@ -11144,6 +12039,36 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("    sudo systemctl restart <unit>     # system-scope")
 
 
+def _refresh_windows_gateway_launchers() -> None:
+    """Regenerate installed Windows gateway launcher scripts after update.
+
+    The Scheduled Task / Startup-folder launchers (``gateway.cmd`` +
+    ``gateway.vbs``) are persistence artifacts written once at install time —
+    ``hermes update`` never touched them, so installs created before the
+    hidden-console rework (aa2ae36c3f) kept launching the gateway through
+    ``pythonw.exe`` forever: every descendant spawn flashed a conhost
+    (#54220/#56747) and, since #70344, the console-less gateway died at
+    startup with ``RuntimeError: sys.stderr is None`` (#71671).
+
+    The task's /TR points at a stable script path, so rewriting the files in
+    place retargets the task without any schtasks call (no UAC needed).
+    ``_write_task_script`` is idempotent and renders from current code, so
+    this is a no-op for modern installs. Best-effort: a failed refresh must
+    never fail the update.
+    """
+    if not _is_windows():
+        return
+    try:
+        from hermes_cli import gateway_windows
+
+        if not gateway_windows.is_installed():
+            return
+        gateway_windows._write_task_script()
+        print("  ✓ Refreshed Windows gateway launcher scripts")
+    except Exception as exc:
+        logger.debug("Could not refresh Windows gateway launchers after update: %s", exc)
+
+
 def _resume_windows_gateways_after_update(token: dict | None) -> None:
     """Restart Windows profile gateways previously paused for update."""
     if not token or not token.get("resume_needed"):
@@ -11151,6 +12076,11 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
     token["resume_needed"] = False
     if not _is_windows():
         return
+
+    # Regenerate the persisted launcher scripts before respawning anything,
+    # so a legacy pythonw-era Scheduled Task / Startup entry comes back on
+    # the current hidden-console design at the next login too.
+    _refresh_windows_gateway_launchers()
 
     profiles = token.get("profiles") or {}
     unmapped = token.get("unmapped") or []
@@ -11790,6 +12720,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
+        _record_bytecode_fingerprint()
 
         # Fork upstream sync logic (only for main branch on forks)
         if is_fork and branch == "main":
@@ -11867,6 +12798,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # based on a narrow 7-package import probe (#58004 review).
         _clear_update_incomplete_marker()
 
+        # The update process is still the old Python interpreter process. Run
+        # one final cache/module refresh immediately before lazy backend
+        # refresh, which imports newly-pulled modules that may depend on fresh
+        # symbols in hermes_constants or lazy_deps. The dependency install
+        # above may also have regenerated bytecode from build-cache copies —
+        # this second sweep catches those stragglers (#60242, #65240).
+        removed = _clear_bytecode_cache(PROJECT_ROOT)
+        if removed:
+            print(
+                f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
+            )
+        _record_bytecode_fingerprint()
+        _reload_updated_runtime_modules()
+
         # Upgrade pip before lazy refreshes — stale pip can fail source builds
         # and leave partially-written packages (#57828).
         _write_lazy_refresh_incomplete_marker()
@@ -11882,6 +12827,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 "  ⚠ Lazy-refresh recovery incomplete — run `hermes` again "
                 "to finish import-based venv repair."
             )
+
+        # Heal the active memory provider's bridge packages last — the core
+        # reinstall + lazy refresh above may have stripped or downgraded
+        # plugin.yaml-declared deps that aren't in extras (#53272, #70636).
+        _refresh_active_memory_provider_dependencies()
 
         node_failures = _update_node_dependencies()
         _build_web_ui(PROJECT_ROOT / "web")
@@ -12019,18 +12969,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("  ✓ Model catalog cache refreshed from checkout")
         except Exception as e:
             logger.debug("Model catalog seed during update failed: %s", e)
-
-        # After git pull, source files on disk are newer than cached Python
-        # modules in this process.  Reload hermes_constants so that any lazy
-        # import executed below (skills sync, gateway restart) sees new
-        # attributes like display_hermes_home() added since the last release.
-        try:
-            import importlib
-            import hermes_constants as _hc
-
-            importlib.reload(_hc)
-        except Exception:
-            pass  # non-fatal — worst case a lazy import fails gracefully
 
         # Sync bundled skills (copies new, updates changed, respects user deletions)
         try:
@@ -12319,6 +13257,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
         except Exception as e:
             logger.debug("FHS PATH guard check failed: %s", e)
 
+        # Self-heal the hermes-acp launcher for installs that predate it, so
+        # ACP hosts (Zed, JetBrains, Buzz) can resolve Hermes on PATH without
+        # a reinstall.  No-op on Windows and when already present.
+        try:
+            _ensure_acp_launcher()
+        except Exception as e:
+            logger.debug("hermes-acp launcher self-heal failed: %s", e)
+
         # Refresh the cua-driver binary used by the Computer Use toolset.
         # The upstream installer is gated on supported platforms and on the
         # binary already being on PATH, so this is a no-op for users who
@@ -12347,7 +13293,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
                 print()
                 print("→ Refreshing cua-driver (Computer Use)...")
-                install_cua_driver(upgrade=True)
+                # require_confirmed_update: only run the (multi-minute,
+                # silent) upstream installer when the driver's native
+                # check-update verb positively reports a newer release.
+                # An indeterminate check (offline, rate-limited, old
+                # driver) keeps the installed version — `hermes update`
+                # must stay fast; `hermes computer-use install --upgrade`
+                # remains the force path.
+                install_cua_driver(upgrade=True, require_confirmed_update=True)
         except Exception as e:
             logger.debug("cua-driver refresh failed: %s", e)
 
@@ -13086,16 +14039,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             logger.debug("Legacy unit check during update failed: %s", e)
 
         # Restart a managed dashboard through systemd, or stop stale manual
-        # dashboard processes.  Raw-killing a systemd-owned dashboard PID makes
+        # dashboard processes. Raw-killing a systemd-owned dashboard PID makes
         # systemd treat it as a clean stop, leaving the Cloudflare origin dead.
         # Preserve the safety rule above: a failed Node refresh leaves the
         # currently running dashboard untouched.
-        if node_failures:
-            print()
-            print("  ℹ Leaving running dashboard process(es) untouched because the")
-            print("    Node.js dependency refresh did not complete.")
-        else:
-            _kill_stale_dashboard_processes(restart_managed=True)
+        _finish_dashboard_update_cleanup(node_failures)
 
         print()
         print("Tip: You can now select a provider and model:")
@@ -13852,40 +14800,31 @@ def _render_distribution_plan(plan) -> None:
 
 
 def _report_dashboard_status() -> int:
-    """Print ``hermes dashboard`` PIDs and return the count.
+    """Print live listening dashboard processes and return the count."""
+    from gateway.status import _pid_exists
 
-    Uses the same detection logic as ``_find_stale_dashboard_pids`` (the
-    current process is excluded, but since ``hermes dashboard --status``
-    runs in a short-lived CLI process that never matches the pattern,
-    the exclusion is irrelevant here).
-    """
-    pids = _find_stale_dashboard_pids()
-    if not pids:
+    live: list[tuple[int, str]] = []
+    for pid, command in _scan_dashboard_processes():
+        runtime = _parse_dashboard_runtime(command)
+        if runtime is None:
+            continue
+        mode, host, port = runtime
+        if mode != "dashboard":
+            continue
+        if port <= 0 or not _pid_exists(pid):
+            continue
+        if not _dashboard_listening(host, port):
+            continue
+        live.append((pid, command))
+
+    if not live:
         print("No hermes dashboard processes running.")
         return 0
 
-    print(f"{len(pids)} hermes dashboard process(es) running:")
-    for pid in pids:
-        # Best-effort: show the full cmdline so users can tell profiles apart.
-        cmdline = ""
-        try:
-            if sys.platform != "win32":
-                cmdline_path = f"/proc/{pid}/cmdline"
-                if os.path.exists(cmdline_path):
-                    with open(cmdline_path, "rb") as f:
-                        cmdline = (
-                            f.read()
-                            .replace(b"\x00", b" ")
-                            .decode("utf-8", errors="replace")
-                            .strip()
-                        )
-        except (OSError, ValueError):
-            pass
-        if cmdline:
-            print(f"    PID {pid}: {cmdline}")
-        else:
-            print(f"    PID {pid}")
-    return len(pids)
+    print(f"{len(live)} hermes dashboard process(es) running:")
+    for pid, command in live:
+        print(f"    PID {pid}: {command}")
+    return len(live)
 
 
 def _dashboard_listening(host: str, port: int) -> bool:
@@ -13897,7 +14836,7 @@ def _dashboard_listening(host: str, port: int) -> bool:
     import socket
 
     try:
-        with socket.create_connection((host or "127.0.0.1", port), timeout=1.5):
+        with socket.create_connection((_dashboard_probe_host(host), port), timeout=1.5):
             return True
     except OSError:
         return False
@@ -14553,7 +15492,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
@@ -14653,6 +15592,35 @@ def _plugin_cli_discovery_needed() -> bool:
     # prompt, argparse will route it via positional handling and the
     # extra discovery cost is amortized over a full agent run anyway.
     return True
+
+
+def _resolve_deferred_platform_cli_command(command_name: str | None) -> None:
+    """Materialize the deferred platform whose top-level CLI command matches.
+
+    Bundled platform plugins are cheap-registered as *deferred* entries to
+    avoid importing every gateway SDK during normal startup. A platform that
+    registers a top-level ``hermes <name>`` command (e.g. Photon ->
+    ``ctx.register_cli_command(name="photon", ...)``) only runs that side
+    effect when its module is imported. On the unknown-top-level-command slow
+    path, ``discover_plugins()`` records the deferred loader but does not
+    import it, so the CLI registration never happens and ``hermes photon``
+    fails with argparse ``invalid choice`` (issue #54678).
+
+    Resolving only the platform whose name matches the first positional token
+    keeps normal startup cheap while making the targeted command available.
+    """
+    if not command_name:
+        return
+    try:
+        from gateway.platform_registry import platform_registry
+
+        platform_registry.get(command_name)
+    except Exception as exc:
+        logging.getLogger(__name__).debug(
+            "Deferred platform CLI resolution failed for %s: %s",
+            command_name,
+            exc,
+        )
 
 
 _AGENT_COMMANDS = {None, "chat", "acp", "rl"}
@@ -15070,6 +16038,12 @@ def main():
     except Exception:
         pass
 
+    # If the checkout changed since the last launch (hermes update, manual
+    # git pull, old-updater update that predates newer clears), sweep stale
+    # __pycache__ once so no process — this one's lazy imports included —
+    # resolves fresh source against old bytecode. Never raises.
+    _sweep_stale_bytecode_if_checkout_changed()
+
     # Self-heal a venv left half-built by an interrupted ``hermes update``
     # (Ctrl-C, terminal close, WSL OOM mid-install). Skip when the user is
     # *running* update — that flow writes and clears its own marker, and we
@@ -15395,6 +16369,11 @@ def main():
     build_security_parser(subparsers, cmd_security=cmd_security)
 
     # =========================================================================
+    # approvals command  (parser built in hermes_cli/subcommands/approvals.py)
+    # =========================================================================
+    build_approvals_parser(subparsers, cmd_approvals=cmd_approvals)
+
+    # =========================================================================
     # dump command  (parser built in hermes_cli/subcommands/dump.py)
     # =========================================================================
     build_dump_parser(subparsers, cmd_dump=cmd_dump)
@@ -15504,6 +16483,11 @@ def main():
                 seen_plugin_commands.add(cmd_info["name"])
 
             discover_plugins()
+            # A bundled platform whose top-level CLI command is the one being
+            # invoked is still only a deferred entry at this point; import it
+            # so its register_cli_command side effect runs before we read
+            # _cli_commands (issue #54678).
+            _resolve_deferred_platform_cli_command(_first_positional_argv())
             for cmd_info in get_plugin_manager()._cli_commands.values():
                 if cmd_info["name"] in seen_plugin_commands:
                     continue
@@ -15828,7 +16812,7 @@ def main():
         p.add_argument(
             "--newer-than",
             metavar="AGE",
-            help="Only match sessions started within the last AGE "
+            help="Only match sessions active within the last AGE "
             "(e.g. '5h', '2d') or after an ISO timestamp",
         )
         p.add_argument(
@@ -16985,12 +17969,14 @@ def main():
                 print(f"No sessions match ({describe_filters(filters)}).")
                 return
 
-            # Candidates are ordered oldest-first — surface the age span so
-            # the confirmation makes the blast radius obvious.
-            _oldest = candidates[0].get("started_at")
-            _newest = candidates[-1].get("started_at")
+            # Candidates are ordered by activity oldest-first. Surface that
+            # span so a long-lived but recently used conversation cannot look
+            # old merely because of its creation date.
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
             _span = (
-                f"oldest {format_epoch(_oldest)}, newest {format_epoch(_newest)}"
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
             )
 
             if args.dry_run or not args.yes:
@@ -17003,7 +17989,7 @@ def main():
                     title = (s.get("title") or "")[:36]
                     model = (s.get("model") or "-").split("/")[-1][:24]
                     print(
-                        f"  {s['id']}  {format_epoch(s['started_at']):<17} "
+                        f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
                         f"{s['source']:<10} {model:<24} "
                         f"{s['message_count']:>4} msgs  {title}"
                     )

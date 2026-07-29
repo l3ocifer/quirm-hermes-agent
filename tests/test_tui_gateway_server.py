@@ -37,7 +37,7 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
-def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
+def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "config.yaml").write_text("max_concurrent_sessions: 1\n", encoding="utf-8")
@@ -56,23 +56,31 @@ def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
         monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
 
+        # Opening a chat must NOT take a slot. Every tile paint and every
+        # background reconnect-resume calls session.create, and an unprompted
+        # draft has no DB row and is filtered out of the sidebar — so a slot
+        # held here is invisible to the user while still starving the other
+        # surfaces that share this cap.
         first = server._methods["session.create"]("r1", {"cols": 80})
-        assert "result" in first
-        sid = first["result"]["session_id"]
-
         second = server._methods["session.create"]("r2", {"cols": 80})
-        assert second["error"]["message"] == (
-            "Hermes is at the active session limit (1/1). "
-            "Try again when another session finishes."
-        )
-        assert list(server._sessions) == [sid]
+        assert "result" in first and "result" in second
+        sid = first["result"]["session_id"]
+        other = second["result"]["session_id"]
+        assert active_session_registry_snapshot() == []
+
+        # The first turn is what claims the slot, and is re-entrant.
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert len(active_session_registry_snapshot()) == 1
+
+        blocked = server._ensure_active_session_slot(other, server._sessions[other])
+        assert "active session limit (1/1)" in blocked
 
         closed = server._methods["session.close"]("r3", {"session_id": sid})
         assert closed["result"]["closed"] is True
         assert active_session_registry_snapshot() == []
 
-        third = server._methods["session.create"]("r4", {"cols": 80})
-        assert "result" in third
+        assert server._ensure_active_session_slot(other, server._sessions[other]) is None
     finally:
         _clear_server_sessions()
         server._cfg_cache = None
@@ -94,6 +102,7 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     session_key = "cwd-key"
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     launcher = tmp_path / "apps" / "desktop"
     launcher.mkdir(parents=True)
 
@@ -564,6 +573,155 @@ def _write_profile_cfg(home: Path, cwd: str | None) -> Path:
     cfg = {"terminal": {"cwd": cwd}} if cwd is not None else {}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
     return home
+
+
+def test_profile_scoped_mcp_discovery_uses_target_home(monkeypatch, tmp_path):
+    """MCP discovery must start under the selected profile's HERMES_HOME."""
+    from hermes_cli import mcp_startup
+    from hermes_constants import get_hermes_home
+    from tui_gateway import entry
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    (profile_home / "config.yaml").write_text(
+        "mcp_servers:\n"
+        "  bluesky_sheepyr:\n"
+        "    command: test-command\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+    token = set_hermes_home_override(str(profile_home))
+
+    seen = []
+
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_started", False)
+    monkeypatch.setattr(mcp_startup, "_mcp_discovery_thread", None)
+    # ensure_mcp_discovery_started flips this module global; monkeypatch it so
+    # the enablement doesn't leak into sibling tests in this file.
+    monkeypatch.setattr(entry, "_mcp_discovery_enabled", False)
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+
+    try:
+        entry.ensure_mcp_discovery_started()
+        thread = mcp_startup._mcp_discovery_thread
+        assert thread is not None
+        thread.join(timeout=2)
+    finally:
+        reset_hermes_home_override(token)
+        mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_started = False
+
+    assert seen == [str(profile_home)]
+
+
+def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
+    monkeypatch, tmp_path
+):
+    """Agent construction must start MCP discovery under the selected profile."""
+    import threading
+
+    from hermes_constants import get_hermes_home
+
+    profile_home = tmp_path / "profiles" / "sheepyr"
+    profile_home.mkdir(parents=True)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    seen = []
+    built = threading.Event()
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: built.set()
+        or type("Agent", (), {"model": "test"})(),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started",
+        lambda: seen.append(str(get_hermes_home())),
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+
+    ready = threading.Event()
+    sid = "test-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert built.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert seen == [str(profile_home)]
+
+
+def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path):
+    """Agent construction must install the selected profile's secret scope.
+
+    Without it, get_secret() falls through to process os.environ, so a session
+    "switched" to profile X resolves credentials from the LAUNCH profile's
+    .env (#67605 item 2).
+    """
+    import threading
+
+    from agent.secret_scope import current_secret_scope
+
+    profile_home = tmp_path / "profiles" / "grace"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "PROXMOX_TOKEN=grace-secret\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
+
+    scopes = []
+    built = threading.Event()
+
+    def _fake_make_agent(*args, **kwargs):
+        scope = current_secret_scope()
+        scopes.append(dict(scope) if scope else None)
+        built.set()
+        return type("Agent", (), {"model": "test"})()
+
+    monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+
+    ready = threading.Event()
+    sid = "test-secret-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-secret-key",
+        "profile_home": str(profile_home),
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert built.wait(timeout=2)
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
@@ -1126,6 +1284,7 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         assert captured["silence_duration"] == 3.0
         assert captured["auto_restart"] is False
 
+
     # Round-12 Copilot review regression on #19835: ``bool`` is a subclass
     # of ``int``, so the naive ``isinstance(threshold, (int, float))``
     # guard would forward ``silence_threshold: true`` as ``1`` instead
@@ -1154,6 +1313,407 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
             captured["silence_duration"] == 3.0
         ), f"bool silence_duration leaked through for {bad_bool_cfg!r}"
         assert captured["auto_restart"] is False
+
+
+def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
+    """Typed bare stop phrase during an active voice chat is consumed at the
+    prompt.submit choke point: voice mode flips off, a distinct
+    voice.transcript {stop_phrase, typed} event fires, and NO turn starts.
+    """
+    calls = {"stop_continuous": 0}
+    emitted = []
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, payload))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            is_voice_stop_phrase=lambda t: t.strip().lower().strip(".!?") == "stop"
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            stop_continuous=lambda force_transcribe=False: calls.__setitem__(
+                "stop_continuous", calls["stop_continuous"] + 1
+            )
+        ),
+    )
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda user_barge=False: None)
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setenv("HERMES_VOICE_TTS", "1")
+
+    resp = server.dispatch(
+        {
+            "id": "typed-stop",
+            "method": "prompt.submit",
+            "params": {"session_id": "any-sid", "text": "Stop."},
+        }
+    )
+
+    assert resp["result"] == {"voice_stopped": True}
+    assert os.environ["HERMES_VOICE"] == "0"
+    assert os.environ["HERMES_VOICE_TTS"] == "0"
+    assert calls["stop_continuous"] == 1
+    assert ("voice.transcript", {"stop_phrase": True, "typed": True}) in emitted
+
+
+def test_prompt_submit_typed_stop_passes_through_when_voice_off(monkeypatch):
+    """Outside a voice chat, typed "stop" is a normal message — the stop
+    matcher must not even be consulted (guard is on voice mode)."""
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            is_voice_stop_phrase=lambda t: (_ for _ in ()).throw(
+                AssertionError("stop matcher must not run when voice is off")
+            )
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "0")
+
+    resp = server.dispatch(
+        {
+            "id": "typed-stop-off",
+            "method": "prompt.submit",
+            "params": {"session_id": "missing-sid", "text": "stop"},
+        }
+    )
+
+    # The submit proceeds into normal handling (here: unknown session error),
+    # NOT the voice_stopped consumption path.
+    assert resp.get("result") != {"voice_stopped": True}
+
+
+def test_prompt_submit_longer_text_not_consumed_in_voice_mode(monkeypatch):
+    """"stop the build" while voice is on must reach the agent path."""
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.voice_mode",
+        types.SimpleNamespace(
+            is_voice_stop_phrase=lambda t: t.strip().lower().strip(".!?") == "stop"
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    resp = server.dispatch(
+        {
+            "id": "typed-long",
+            "method": "prompt.submit",
+            "params": {"session_id": "missing-sid", "text": "stop the build"},
+        }
+    )
+
+    assert resp.get("result") != {"voice_stopped": True}
+
+
+def test_wake_owner_is_sticky_and_routes_detection_to_first_transport(monkeypatch):
+    from tools import wake_word
+
+    state = {"owner": None, "callback": None, "paused": False}
+    voice_callbacks = {}
+
+    def start_listening(callback, *, owner, config):
+        if state["owner"] is not None and state["owner"] is not owner:
+            raise wake_word.WakeWordInUse
+        state.update(owner=owner, callback=callback, paused=False)
+
+    def pause_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state["paused"] = True
+        return True
+
+    def stop_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state.update(owner=None, callback=None, paused=False)
+        return True
+
+    def resume_listening(*, owner):
+        if state["owner"] is not owner:
+            return False
+        state["paused"] = False
+        return True
+
+    def start_continuous(**callbacks):
+        voice_callbacks.update(callbacks)
+        return True
+
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: {
+        "enabled": True,
+        "phrase": "hey hermes",
+        "surface": "auto",
+        "start_new_session": True,
+    })
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", lambda _cfg: {
+        "available": True,
+        "phrase": "hey hermes",
+        "provider": "test",
+        "hint": "",
+    })
+    monkeypatch.setattr(wake_word, "start_listening", start_listening)
+    monkeypatch.setattr(wake_word, "pause_listening", pause_listening)
+    monkeypatch.setattr(wake_word, "stop_listening", stop_listening)
+    monkeypatch.setattr(wake_word, "owns_listener", lambda owner: state["owner"] is owner)
+    monkeypatch.setattr(
+        wake_word,
+        "is_listening",
+        lambda: state["owner"] is not None and not state["paused"],
+    )
+    monkeypatch.setattr(
+        wake_word,
+        "resume_listening",
+        resume_listening,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=start_continuous,
+            stop_continuous=lambda **_kwargs: None,
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    first = types.SimpleNamespace(_closed=False)
+    second = types.SimpleNamespace(_closed=False)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append(
+            (event, sid, payload, server.current_transport())
+        ),
+    )
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        started = server.dispatch({
+            "id": "wake-1",
+            "method": "wake.start",
+            "params": {"surface": "gui", "session_id": "first-session"},
+        }, transport=first)
+        denied = server.dispatch({
+            "id": "wake-2",
+            "method": "wake.start",
+            "params": {"surface": "tui", "session_id": "second-session"},
+        }, transport=second)
+        denied_stop = server.dispatch({
+            "id": "wake-stop-2",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=second)
+        denied_voice_stop = server.dispatch({
+            "id": "voice-stop-2",
+            "method": "voice.record",
+            "params": {"action": "stop"},
+        }, transport=second)
+
+        assert started["result"]["started"] is True
+        assert denied["result"] == {
+            "started": False,
+            "reason": "owned",
+            "owner_surface": "gui",
+        }
+        assert denied_stop["result"] == {
+            "stopped": False,
+            "reason": "not_owner",
+            "disabled_persisted": False,
+        }
+        assert denied_voice_stop["result"] == {
+            "status": "busy",
+            "reason": "wake_owned",
+        }
+
+        state["callback"]()
+        assert emitted == [(
+            "wake.detected",
+            "first-session",
+            {"phrase": "hey hermes", "profile": None, "start_new_session": True},
+            first,
+        )]
+        assert state["paused"] is True
+
+        voice_started = server.dispatch({
+            "id": "voice-start-1",
+            "method": "voice.record",
+            "params": {"action": "start", "session_id": "first-session"},
+        }, transport=first)
+        assert voice_started["result"]["status"] == "recording"
+        voice_callbacks["on_status"]("idle")
+        assert state["paused"] is False
+
+        stopped = server.dispatch({
+            "id": "wake-stop-1",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=first)
+        assert stopped["result"] == {
+            "stopped": True,
+            "reason": None,
+            "disabled_persisted": False,
+        }
+
+        reclaimed = server.dispatch({
+            "id": "wake-reclaim-2",
+            "method": "wake.start",
+            "params": {"surface": "tui", "session_id": "second-session"},
+        }, transport=second)
+        assert reclaimed["result"]["started"] is True
+        assert state["owner"] is second
+
+        state["callback"]()
+        assert emitted[-1] == (
+            "wake.detected",
+            "second-session",
+            {"phrase": "hey hermes", "profile": None, "start_new_session": True},
+            second,
+        )
+
+        stopped_again = server.dispatch({
+            "id": "wake-stop-2-after-reclaim",
+            "method": "wake.stop",
+            "params": {},
+        }, transport=second)
+        assert stopped_again["result"] == {
+            "stopped": True,
+            "reason": None,
+            "disabled_persisted": False,
+        }
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
+def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch):
+    """The ear toggle / /wake on|off write wake_word.enabled; auto-arm never does."""
+    from tools import wake_word
+
+    config = {"enabled": False, "phrase": "hey hermes", "surface": "auto",
+              "start_new_session": True}
+    persisted = []
+
+    def fake_persist(enabled):
+        persisted.append(enabled)
+        config["enabled"] = enabled
+        return True
+
+    monkeypatch.setattr(server, "_persist_wake_enabled", fake_persist)
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: dict(config))
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", lambda _cfg: {
+        "available": True,
+        "phrase": "hey hermes",
+        "provider": "test",
+        "hint": "",
+    })
+    listener = {"owner": None}
+    monkeypatch.setattr(
+        wake_word, "start_listening",
+        lambda callback, *, owner, config: listener.update(owner=owner),
+    )
+    monkeypatch.setattr(
+        wake_word, "stop_listening",
+        lambda *, owner: listener["owner"] is owner and not listener.update(owner=None),
+    )
+    monkeypatch.setattr(wake_word, "owns_listener", lambda owner: listener["owner"] is owner)
+
+    transport = types.SimpleNamespace(_closed=False)
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        # Passive auto-arm (no persist): refused, config untouched.
+        passive = server.dispatch({
+            "id": "wake-passive",
+            "method": "wake.start",
+            "params": {"surface": "gui"},
+        }, transport=transport)
+        assert passive["result"] == {"started": False, "reason": "disabled"}
+        assert persisted == []
+
+        # Explicit gesture: enables in config AND arms.
+        clicked = server.dispatch({
+            "id": "wake-click",
+            "method": "wake.start",
+            "params": {"surface": "gui", "persist": True},
+        }, transport=transport)
+        assert clicked["result"]["started"] is True
+        assert clicked["result"]["enabled_persisted"] is True
+        assert persisted == [True]
+
+        # Explicit stop: disables in config.
+        stopped = server.dispatch({
+            "id": "wake-click-off",
+            "method": "wake.stop",
+            "params": {"persist": True},
+        }, transport=transport)
+        assert stopped["result"]["stopped"] is True
+        assert stopped["result"]["disabled_persisted"] is True
+        assert persisted == [True, False]
+
+        # persist does NOT override an explicit surface scoping.
+        config.update(enabled=True, surface="tui")
+        scoped = server.dispatch({
+            "id": "wake-scoped",
+            "method": "wake.start",
+            "params": {"surface": "gui", "persist": True},
+        }, transport=transport)
+        assert scoped["result"] == {"started": False, "reason": "disabled_for_surface"}
+        assert persisted == [True, False]
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
+def test_voice_record_start_forwards_max_recording_seconds(monkeypatch):
+    """voice.max_recording_seconds must reach start_continuous from the TUI.
+
+    The CLI wiring alone doesn't cover TUI recordings: the gateway forwards
+    recorder params explicitly, so a missing kwarg here silently leaves the
+    cap dead in the TUI while CLI tests stay green. Semantics mirror the
+    silence params: non-numeric / bool / missing falls back to the documented
+    120 default, an explicit numeric value <= 0 disables the cap.
+    """
+    captured: dict = {}
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous, stop_continuous=lambda: None
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+
+    for cfg, expected in (
+        ({"max_recording_seconds": 45}, 45),        # explicit cap forwarded as-is
+        ({"max_recording_seconds": 0}, 0.0),        # explicit 0 = disabled
+        ({"max_recording_seconds": -5}, 0.0),       # negative = disabled
+        ({}, 120.0),                                # missing = documented default
+        ({"max_recording_seconds": True}, 120.0),   # bool must not become 1s cap
+        ({"max_recording_seconds": "long"}, 120.0), # garbage = documented default
+    ):
+        captured.clear()
+        monkeypatch.setattr(server, "_load_cfg", lambda c=cfg: {"voice": c})
+
+        resp = server.dispatch(
+            {
+                "id": "voice-record-cap",
+                "method": "voice.record",
+                "params": {"action": "start"},
+            }
+        )
+
+        assert "result" in resp, f"voice.record raised for cfg={cfg!r}: {resp.get('error')}"
+        assert resp["result"]["status"] == "recording"
+        assert (
+            captured["max_recording_seconds"] == expected
+        ), f"cfg={cfg!r} forwarded {captured.get('max_recording_seconds')!r}, expected {expected!r}"
 
 
 def test_voice_record_stop_forces_transcription(monkeypatch):
@@ -1456,10 +2016,22 @@ def test_history_to_messages_preserves_tool_calls_for_resume_display():
 
     assert server._history_to_messages(history) == [
         {"role": "user", "text": "first prompt"},
-        {"context": "Searching files for resume", "name": "search_files", "role": "tool"},
+        {"context": "resume", "name": "search_files", "role": "tool"},
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second prompt"},
     ]
+
+
+def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():
+    # Clients phrase their own verb around this string: the TUI renders
+    # `Terminal("<ctx>")` and the desktop prepends "Running"/"Ran". Sending a
+    # pre-phrased label made both stutter ("Ran Running sleep 70 + 2 commands")
+    # and stood in for the real command in the desktop's `$` transcript.
+    assert server._tool_ctx("terminal", {"command": 'sleep 70; echo "a"; echo "b"'}) == (
+        "sleep 70 + 2 commands"
+    )
+    assert server._tool_ctx("read_file", {"path": "/tmp/demo/package.json"}) == "package.json"
+    assert server._tool_ctx("web_search", {"query": "weather in NYC"}) == "weather in NYC"
 
 
 def test_history_to_messages_keeps_reasoning_only_assistant_turn():
@@ -1549,6 +2121,155 @@ def test_history_to_messages_hides_gateway_system_markers():
         {"role": "assistant", "text": "first answer"},
         {"role": "user", "text": "second question"},
         {"role": "assistant", "text": "second answer"},
+    ]
+
+
+def test_history_to_messages_drops_display_hidden_scaffolding():
+    # A mid-stream steer persists an interrupted-turn checkpoint. When nothing
+    # reached the screen the row carries only model-facing scaffolding and is
+    # marked display_kind="hidden"; the scaffolded bytes live in the server-only
+    # api_content sidecar for provider replay. This projection -- the single
+    # display source every client reads -- must drop the row by its declared
+    # display_kind, not just the "[System:" string convention, or the raw
+    # "[This response was interrupted by a user correction.]" paints as an
+    # assistant bubble (and api_content must never ship to a client).
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": "[This response was interrupted by a user correction.]",
+            "api_content": "[This response was interrupted by a user correction.]",
+            "display_kind": "hidden",
+        },
+        {"role": "user", "content": "i love you"},
+        {
+            "role": "assistant",
+            "content": "Love you too",
+            "api_content": (
+                "[This response was interrupted by a user correction.]\n\n"
+                "Visible response before the interruption:\n\nLove you too"
+            ),
+        },
+    ]
+
+    projected = server._history_to_messages(history)
+
+    assert projected == [
+        {"role": "user", "text": "go"},
+        {"role": "user", "text": "i love you"},
+        {"role": "assistant", "text": "Love you too"},
+    ]
+    # Server-only sidecar never crosses the wire.
+    assert all("api_content" not in m for m in projected)
+
+
+def test_history_to_messages_projects_a_skill_turn_to_its_invocation():
+    # A /skill invocation is persisted EXPANDED: the activation note plus the
+    # entire skill body. That payload is model-facing scaffolding -- this
+    # projection is the single display source every client reads, so it must
+    # hand back the invocation the user typed and never the body. Without it a
+    # chat bubble renders the whole skill as if the user had written it.
+    scaffolded = (
+        '[IMPORTANT: The user has invoked the "work" skill, indicating they '
+        "want you to follow its instructions. The full skill content is "
+        "loaded below.]\n\n"
+        "# /work\n\nSPIN UP A WORKTREE, never the primary checkout.\n\n"
+        "The user has provided the following instruction alongside the skill "
+        "invocation: fix the title leak"
+    )
+
+    history = [
+        {"role": "user", "content": scaffolded},
+        {"role": "assistant", "content": "on it"},
+    ]
+
+    assert server._history_to_messages(history) == [
+        {
+            "role": "user",
+            "text": "/work fix the title leak",
+            "display_kind": "skill_invocation",
+        },
+        {"role": "assistant", "text": "on it"},
+    ]
+
+
+def test_history_to_messages_projects_a_bare_skill_turn_to_the_command():
+    scaffolded = (
+        '[IMPORTANT: The user has invoked the "work" skill, indicating they '
+        "want you to follow its instructions. The full skill content is "
+        "loaded below.]\n\n# /work\n\nSPIN UP A WORKTREE."
+    )
+
+    assert server._history_to_messages([{"role": "user", "content": scaffolded}]) == [
+        {"role": "user", "text": "/work", "display_kind": "skill_invocation"}
+    ]
+
+
+def test_expand_skill_invocation_for_replay_round_trips_the_projection(
+    tmp_path, monkeypatch
+):
+    # Rewind/regenerate replays a turn from what the transcript SHOWS, and a
+    # skill turn shows its invocation. Re-running that verbatim would send the
+    # agent the literal "/work fix it" instead of the skill, so the server
+    # re-expands it — the exact inverse of _skill_scaffold_projection, with the
+    # body never leaving the server.
+    import agent.skill_commands as skill_commands
+    import agent.skill_utils as skill_utils
+    import tools.skills_tool as skills_tool
+
+    skills_dir = tmp_path / "skills"
+    (skills_dir / "worktree-kickoff").mkdir(parents=True)
+    (skills_dir / "worktree-kickoff" / "SKILL.md").write_text(
+        "---\nname: worktree-kickoff\ndescription: Spin up a worktree\n---\n\n"
+        "# kickoff\n\nSPIN UP A WORKTREE, never the primary checkout.\n"
+    )
+    monkeypatch.setattr(skills_tool, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda *a, **k: [])
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+    skill_commands.scan_skill_commands()
+
+    expanded = server._expand_skill_invocation_for_replay(
+        "/worktree-kickoff fix it", "task-1"
+    )
+
+    assert "SPIN UP A WORKTREE" in expanded
+    assert server._skill_scaffold_projection(expanded) == "/worktree-kickoff fix it"
+
+
+def test_expand_skill_invocation_for_replay_leaves_ordinary_text_alone(monkeypatch):
+    import agent.skill_commands as skill_commands
+    import agent.skill_utils as skill_utils
+
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda *a, **k: [])
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_platform", None)
+
+    assert server._expand_skill_invocation_for_replay("just words", "t") == "just words"
+    # A core slash command is not a skill — nothing to expand.
+    assert server._expand_skill_invocation_for_replay("/status", "t") == "/status"
+
+
+def test_history_to_messages_types_a_legacy_auto_continue_row():
+    # A crash-interrupted turn used to be typed only AFTER it finished, so a
+    # turn killed a second time (or any row written before turn-start typing
+    # landed) sits in the DB untyped and painted the raw recovery note as a
+    # user bubble. The projection recognizes the synthetic note's fixed
+    # prefix so those rows still read as a timeline event.
+    history = [
+        {"role": "user", "content": "keep going"},
+        {"role": "user", "content": server._auto_continue_note("keep going")},
+    ]
+
+    projected = server._history_to_messages(history)
+
+    assert projected == [
+        {"role": "user", "text": "keep going"},
+        {
+            "role": "user",
+            "text": server._auto_continue_note("keep going"),
+            "display_kind": "auto_continue",
+        },
     ]
 
 
@@ -6970,6 +7691,66 @@ def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     assert resp["result"]["canon"]["/notes"] == "/notes"
 
 
+def test_commands_catalog_ranks_skill_commands_by_recorded_usage(monkeypatch):
+    """Skill entries carry the usage + origin the `/` menu ranks on.
+
+    Without it the menu is alphabetical, so a bundled skill the user has never
+    opened outranks the one they invoke daily.
+    """
+    monkeypatch.setattr(
+        server,
+        "_skill_usage_lookup",
+        lambda: (
+            lambda name: {"research": 60, "work": 172}.get(name, 0),
+            lambda name: "bundled" if name == "research-paper-writing" else "local",
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.scan_skill_commands",
+        lambda: {
+            "/research": {"name": "research", "description": "Look it up"},
+            "/research-paper-writing": {
+                "name": "research-paper-writing",
+                "description": "Write a paper",
+            },
+            "/work": {"name": "work", "description": "Fresh worktree"},
+        },
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    skills = resp["result"]["skills"]
+    assert skills["/work"] == {"usage": 172, "origin": "local"}
+    assert skills["/research"] == {"usage": 60, "origin": "local"}
+    assert skills["/research-paper-writing"] == {"usage": 0, "origin": "bundled"}
+
+    # Every advertised skill command is rankable — a missing entry silently
+    # sorts that skill to the bottom of the menu.
+    advertised = {name for name, _ in resp["result"]["pairs"]}
+    assert set(skills) <= advertised
+    assert resp["result"]["skill_count"] == len(skills)
+
+
+def test_commands_catalog_survives_an_unreadable_usage_sidecar(monkeypatch):
+    """A broken/absent .usage.json degrades to no ranking, never a broken menu."""
+    monkeypatch.setattr(
+        "tools.skill_usage.load_usage",
+        lambda: (_ for _ in ()).throw(OSError("sidecar is gone")),
+    )
+
+    resp = server.handle_request(
+        {"id": "1", "method": "commands.catalog", "params": {}}
+    )
+
+    assert "error" not in resp
+    assert all(
+        entry == {"usage": 0, "origin": "local"}
+        for entry in resp["result"]["skills"].values()
+    )
+
+
 def test_commands_catalog_includes_tui_mouse_command():
     resp = server.handle_request(
         {"id": "1", "method": "commands.catalog", "params": {}}
@@ -7017,6 +7798,8 @@ def test_commands_catalog_filters_gateway_only_commands_and_keeps_status_visible
 
     assert "/status" in pairs
     assert canon["/status"] == "/status"
+    assert "/approvals" in pairs
+    assert resp["result"]["sub"]["/approvals"] == ["manual", "smart", "off"]
 
     assert "/topic" not in pairs
     assert "/approve" not in pairs
@@ -7271,6 +8054,54 @@ def test_rollback_restore_resolves_number_and_file_path():
     assert calls["args"][2] == "src/app.tsx"
 
 
+def test_rollback_restore_truncates_from_real_user_turn_not_marker(monkeypatch):
+    """rollback.restore must truncate from the last *real* user turn,
+    not a display_kind timeline marker (same bug class as /undo).
+    """
+    from pathlib import Path as _Path
+
+    class _Mgr:
+        enabled = True
+
+        def list_checkpoints(self, cwd):
+            return [{"hash": "abc123"}]
+
+        def restore(self, cwd, target, file_path=None):
+            return {"success": True, "message": "restored"}
+
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second question"},
+        {"role": "assistant", "content": "second answer"},
+        {
+            "role": "user",
+            "content": "background agent finished",
+            "display_kind": "async_delegation_complete",
+        },
+    ]
+    server._sessions["sid"] = _session(
+        agent=types.SimpleNamespace(_checkpoint_mgr=_Mgr()),
+        history=list(history),
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "rollback.restore",
+                "params": {"session_id": "sid", "hash": "abc123"},
+            }
+        )
+
+        assert resp["result"]["success"] is True
+        assert resp["result"]["history_removed"] == 3  # q2 + a2 + marker
+        # Only first exchange remains
+        remaining = server._sessions["sid"]["history"]
+        assert [m["content"] for m in remaining] == ["first question", "first answer"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ── session.steer ────────────────────────────────────────────────────
 
 
@@ -7369,9 +8200,54 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
         "text": "use Postgres",
     }
     assert calls == ["use Postgres"]
-    assert session["inflight_turn"]["user"] == "use Postgres"
+    # The correction is recorded alongside the prompt that started the turn,
+    # never over it — resume must be able to rebuild both bubbles.
+    assert session["inflight_turn"]["user"] == "original request"
+    assert session["inflight_turn"]["corrections"] == ["use Postgres"]
     assert session.get("last_active") is not None
     assert before is None or session["last_active"] >= before
+
+
+def test_session_redirect_records_correction_without_erasing_prompt():
+    """A redirect must not overwrite the turn's original user text.
+
+    The inflight snapshot is the only thing session.resume can replay, so
+    overwriting ``user`` erased the prompt that started the turn and the
+    client repainted the thread with the user's message missing.
+    """
+    session = {}
+    server._start_inflight_turn(session, "remove the session counts")
+    server._append_inflight_delta(session, "Moving.")
+    server._record_inflight_correction(session, "hurry up")
+    server._record_inflight_correction(session, "and the worktree ones")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+
+    assert snapshot["user"] == "remove the session counts"
+    assert snapshot["corrections"] == ["hurry up", "and the worktree ones"]
+
+
+def test_inflight_snapshot_omits_corrections_when_none_recorded():
+    session = {}
+    server._start_inflight_turn(session, "just the prompt")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert "corrections" not in snapshot
+
+
+def test_new_turn_does_not_inherit_prior_turn_corrections():
+    session = {}
+    server._start_inflight_turn(session, "first prompt")
+    server._record_inflight_correction(session, "first correction")
+    server._start_inflight_turn(session, "second prompt")
+
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+
+    assert snapshot["user"] == "second prompt"
+    assert "corrections" not in snapshot
 
 
 def test_session_redirect_queues_during_agent_build_window(monkeypatch):
@@ -7759,6 +8635,105 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         ]
         assert server._sessions["sid"]["history_version"] == 2
         assert stub_db.replaced == [("session-key", original_history[:2])]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+# ---------------------------------------------------------------------------
+# session.interrupt must only cancel pending prompts owned by the calling
+# session — it must not blast-resolve clarify/sudo/secret prompts on
+# unrelated sessions sharing the same tui_gateway process.  Without
+# session scoping the other sessions' prompts silently resolve to empty
+# strings, unblocking their agent threads as if the user cancelled.
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
+    """truncate_before_user_ordinal must count only real user turns.
+
+    display_kind timeline rows (model_switch, async_delegation_complete, …)
+    are role=user but no client counts them as user turns. Without the
+    filter, a trailing marker shifts the ordinal so the wrong message is
+    targeted for truncation.
+    """
+
+    seen = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            seen["prompt"] = prompt
+            seen["history"] = conversation_history
+            return {
+                "final_response": "reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+        {
+            "role": "user",
+            "content": "background agent finished",
+            "display_kind": "async_delegation_complete",
+        },
+    ]
+    server._sessions["sid"] = _session(agent=_Agent(), history=original_history)
+
+    class _StubDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    stub_db = _StubDb()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+
+        # ordinal=1 means "truncate before the 2nd-from-last real user turn"
+        # which is "first". The display_kind marker must NOT shift the ordinal.
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited first",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        # With display_kind filter: user_indices = [0, 2] (indices of "first" and "second").
+        # ordinal=1 → user_indices[1] = 2, truncated = history[:2] = [first, first reply].
+        # Without the filter: user_indices = [0, 2, 4] (includes the marker),
+        # ordinal=1 → user_indices[1] = 2, same result by luck — but ordinal=0
+        # would truncate to history[:0] vs history[:0], and higher ordinals shift.
+        assert seen["history"] == original_history[:2], (
+            f"Expected truncation to first 2 messages, got {seen['history']}"
+        )
+        assert stub_db.replaced == [("session-key", original_history[:2])], (
+            f"Expected DB replace with first 2 messages, got {stub_db.replaced}"
+        )
     finally:
         server._sessions.pop("sid", None)
 
@@ -10700,12 +11675,14 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
 # ── verification.status ──────────────────────────────────────────────
 
 
-def test_verification_status_returns_recorded_evidence(tmp_path):
-    home = tmp_path / ".hermes"
-    home.mkdir()
-    token = set_hermes_home_override(home)
+def test_verification_status_returns_recorded_evidence(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "verify"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setattr(server, "_profile_home", lambda p: profile_home if p == "verify" else None)
+    token = set_hermes_home_override(profile_home)
     project = tmp_path / "project"
     project.mkdir()
+    (project / ".git").mkdir()
     (project / "package.json").write_text(
         json.dumps({"scripts": {"test": "vitest"}}),
         encoding="utf-8",
@@ -10726,7 +11703,7 @@ def test_verification_status_returns_recorded_evidence(tmp_path):
             {
                 "id": "1",
                 "method": "verification.status",
-                "params": {"cwd": str(project), "session_id": "sid"},
+                "params": {"cwd": str(project), "session_id": "sid", "profile": "verify"},
             }
         )
     finally:
@@ -11656,22 +12633,22 @@ def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
 
 def test_make_agent_nested_max_turns_takes_priority(monkeypatch):
     _setup_make_agent_mocks(
-        monkeypatch, {"agent": {"max_turns": 500}, "max_turns": 100}
+        monkeypatch, {"agent": {"max_turns": 400}, "max_turns": 100}
     )
 
     with patch("run_agent.AIAgent") as mock_agent:
         server._make_agent("sid1", "key1")
 
-    assert mock_agent.call_args.kwargs["max_iterations"] == 500
+    assert mock_agent.call_args.kwargs["max_iterations"] == 400
 
 
-def test_make_agent_defaults_to_90(monkeypatch):
+def test_make_agent_defaults_to_500(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
 
     with patch("run_agent.AIAgent") as mock_agent:
         server._make_agent("sid1", "key1")
 
-    assert mock_agent.call_args.kwargs["max_iterations"] == 90
+    assert mock_agent.call_args.kwargs["max_iterations"] == 500
 
 
 def test_make_agent_uses_session_runtime_overrides(monkeypatch):
@@ -13178,9 +14155,9 @@ def test_persist_model_switch_preserves_sibling_model_keys(tmp_path, monkeypatch
         "agent:\n"
         "  system_prompt: keepme\n"
     )
-    # save_config_value() resolves the config path from cli._hermes_home, which
-    # is captured at import time — patch it directly (set_hermes_home_override
-    # does NOT affect this snapshot).
+    # save_config_value() resolves the config path from get_hermes_home() (live
+    # env var), always targeting HERMES_HOME/config.yaml — point it at tmp_path.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     result = types.SimpleNamespace(
@@ -13213,6 +14190,7 @@ def test_persist_model_switch_clears_stale_base_url(tmp_path, monkeypatch):
         "  provider: custom:mylocal\n"
         "  base_url: http://localhost:1234/v1\n"
     )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(cli, "_hermes_home", tmp_path)
 
     # Switch to a native provider with no base_url.
@@ -13702,6 +14680,30 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
     assert result == "answer"
     assert captured["event"] == "clarify.request"
     assert captured["timeout"] == 42
+    assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
+
+
+def test_clarify_callback_multi_select_hint(monkeypatch):
+    """multi_select=True adds the hint to the payload; the single-select
+    payload shape stays byte-identical to the pre-multi-select protocol
+    (older renderers must never see the extra field)."""
+    captured = {}
+
+    def fake_block(event, sid, payload, timeout=300):
+        captured.update(payload=payload)
+        return "answer"
+
+    monkeypatch.setattr(server, "_block", fake_block)
+    cb = server._agent_cbs("sid-1")["clarify_callback"]
+
+    cb("Pick many", ["a", "b"], multi_select=True)
+    assert captured["payload"] == {
+        "question": "Pick many",
+        "choices": ["a", "b"],
+        "multi_select": True,
+    }
+
+    cb("Pick one", ["a", "b"], multi_select=False)
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 

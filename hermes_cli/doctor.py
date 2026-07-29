@@ -10,7 +10,13 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.config import (
+    detect_install_method,
+    get_env_path,
+    get_hermes_home,
+    get_project_root,
+    recommended_update_command_for_method,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
@@ -70,6 +76,22 @@ def _system_package_install_cmd(pkg: str) -> str:
     if sys.platform == "darwin":
         return f"brew install {pkg}"
     return f"sudo apt install {pkg}"
+
+
+def _sqlite_upgrade_hint(install_method: str | None = None) -> str:
+    """Return an actionable SQLite upgrade hint for this install layout."""
+    method = install_method or detect_install_method(PROJECT_ROOT)
+    if method == "docker":
+        command = recommended_update_command_for_method(method)
+        action = f"run `{command}`, then recreate all Hermes containers"
+    elif method in {"nix", "nixos"}:
+        action = recommended_update_command_for_method(method)
+    else:
+        action = "run `hermes update`"
+    return (
+        f"({action}; fixed versions: 3.51.3+ / 3.50.7 / 3.44.6 — "
+        "see https://sqlite.org/wal.html#walresetbug)"
+    )
 
 
 def _safe_which(cmd: str) -> str | None:
@@ -827,8 +849,7 @@ def run_doctor(args):
             # best-effort and unsupported installs may need manual action.
             check_warn(
                 f"SQLite {_sqlite_ver} (WAL-reset bug)",
-                "(run `hermes update`; fixed versions: 3.51.3+ / 3.50.7 / "
-                "3.44.6 — see https://sqlite.org/wal.html#walresetbug)",
+                _sqlite_upgrade_hint(),
             )
         else:
             check_ok(f"SQLite {_sqlite_ver}")
@@ -1335,12 +1356,14 @@ def run_doctor(args):
 
     try:
         from hermes_cli.auth import (
-            get_nous_auth_status,
+            get_nous_auth_status_local,
             get_codex_auth_status,
             get_minimax_oauth_auth_status,
         )
 
-        nous_status = get_nous_auth_status()
+        # Read-only display: refresh-free snapshot — doctor must never
+        # trigger an OAuth refresh as a side effect of a health check.
+        nous_status = get_nous_auth_status_local()
         if nous_status.get("logged_in"):
             check_ok("Nous Portal auth", "(logged in)")
         else:
@@ -1790,10 +1813,36 @@ def run_doctor(args):
         agent_browser_path = PROJECT_ROOT / "node_modules" / "agent-browser"
         agent_browser_ok = False
         _which_ab = shutil.which("agent-browser")
+        # `hermes acp --setup-browser` installs agent-browser into the
+        # Hermes-managed node prefix, which isn't necessarily on PATH. Mirror
+        # dep_ensure._has_hermes_agent_browser() so doctor and dep_ensure agree
+        # on what "installed" means; otherwise doctor false-negatives (#53192).
+        # Resolve with PATHEXT-aware ``shutil.which`` (not a bare is_file())
+        # so Windows picks the executable ``.cmd`` shim — the same class of
+        # miss fixed for _has_agent_browser() in #73932.
+        def _which_in(directory) -> str | None:
+            try:
+                if not directory.is_dir():
+                    return None
+                return shutil.which("agent-browser", path=str(directory))
+            except Exception:
+                return None
+
+        _managed_ab = (
+            _which_in(HERMES_HOME / "node" / "bin")
+            or _which_in(HERMES_HOME / "node")
+        )
+        _legacy_ab = _which_in(HERMES_HOME / "node_modules" / ".bin")
         if agent_browser_path.exists():
             check_ok("agent-browser (Node.js)", "(browser automation)")
             agent_browser_ok = True
         elif _which_ab and agent_browser_runnable(_which_ab):
+            check_ok("agent-browser", "(browser automation)")
+            agent_browser_ok = True
+        elif _managed_ab and agent_browser_runnable(_managed_ab):
+            check_ok("agent-browser", "(browser automation)")
+            agent_browser_ok = True
+        elif _legacy_ab and agent_browser_runnable(_legacy_ab):
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
         elif _which_ab:
@@ -1827,7 +1876,7 @@ def run_doctor(args):
                     _chromium_installed,
                     _is_camofox_mode,
                     _get_cloud_provider,
-                    _get_cdp_override,
+                    _get_cdp_override_raw,
                     _using_lightpanda_engine,
                 )
             except Exception:
@@ -1840,7 +1889,7 @@ def run_doctor(args):
                 # Lightpanda all bypass the local Chromium requirement.
                 skip_chromium_check = (
                     _is_camofox_mode()
-                    or bool(_get_cdp_override())
+                    or bool(_get_cdp_override_raw())
                     or _get_cloud_provider() is not None
                     or _using_lightpanda_engine()
                 )

@@ -945,7 +945,7 @@ DEFAULT_CONFIG = {
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
     "agent": {
-        "max_turns": 90,
+        "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -1108,6 +1108,18 @@ DEFAULT_CONFIG = {
         # default is 1800s) plus runtime slack.  Set to 0 to disable the
         # gate and restore pre-fix behaviour (always inject).
         "gateway_auto_continue_freshness": 3600,
+        # Max seconds the gateway waits for boot auto-resume turns to finish
+        # before it releases the startup-restore inbound gate.  While startup
+        # restore is in progress the gateway QUEUES every inbound message
+        # instead of replying, so no channel gets an answer until this gate
+        # opens.  Without a bound, one pathologically long resumed turn holds
+        # the gate shut and every channel's inbound piles up unanswered for as
+        # long as that turn runs.  On timeout the gate releases and the slow
+        # resume turn keeps running in the background; duplicate-agent
+        # protection is unaffected because the resume slot is claimed
+        # synchronously before the gate runs.  Set to 0 to disable the bound
+        # (historical "wait forever" behaviour).
+        "gateway_startup_restore_drain_timeout": 30,
         # Stale-stream ceiling for local providers (Ollama, oMLX, llama-cpp) in
         # seconds. When the base stale timeout is at its default (180s) and a
         # local endpoint is detected, this finite ceiling replaces the former
@@ -1409,6 +1421,18 @@ DEFAULT_CONFIG = {
             "same_tool_failure": 8,
             "idempotent_no_progress": 5,
         },
+        # Per-turn runaway-loop caps (inspired by Claude Code v2.1.212,
+        # Week 29, July 2026). Hard ceilings on how many times a runaway-prone
+        # tool may be called within a SINGLE agent loop (turn); the counters
+        # reset at the start of every turn, so a legitimate multi-turn session
+        # is never starved. They are always-on and fire regardless of the
+        # warn/hard-stop thresholds above. A single turn issuing dozens of web
+        # searches or spawning dozens of subagents is already pathological, so
+        # the defaults are low. Set either to 0 to disable that cap (unlimited).
+        "loop_caps": {
+            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
+            "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
+        },
     },
 
     "compression": {
@@ -1560,21 +1584,6 @@ DEFAULT_CONFIG = {
                                       # failure-cooldown / anti-thrash / per-session
                                       # lock guards as every automatic compaction.
                                       # Example: 1800 = compact after 30 min idle.
-    },
-
-    # Kanban subsystem (orchestrator workers + dispatcher-driven child tasks).
-    # See tools/kanban_tools.py and hermes_cli/kanban_db.py for the actual
-    # implementations. Per-platform notification opt-out is handled by the
-    # kanban dashboard (see ``hermes dashboard`` -> Notifications).
-    "kanban": {
-        # Auto-subscribe the originating gateway/TUI session to task
-        # completion + block events when ``kanban_create`` is called from
-        # inside a session that has a persistent delivery channel. The
-        # agent that dispatched the task will get notified automatically
-        # instead of having to poll. Disable to mirror pre-feature
-        # behaviour — e.g. for a profile that prefers explicit
-        # ``kanban_notify-subscribe`` calls per task.
-        "auto_subscribe_on_create": True,
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -1969,6 +1978,14 @@ DEFAULT_CONFIG = {
         # Show a color-coded battery read-out as the first status-bar element in
         # the CLI/TUI (off by default). No-op on machines without a battery.
         "battery": False,
+        # Focus view (/focus): display-only reduced-output mode. When true the
+        # CLI/TUI pins tool_progress to "off" (reusing the existing suppression
+        # path), reports a per-turn hidden-line count with a recovery hint, and
+        # pins a "focus" segment in the status bar. focus_saved_tool_progress
+        # holds the mode /focus off restores. Never affects what is sent to the
+        # model — see hermes_cli/focus_view.py.
+        "focus_view": False,
+        "focus_saved_tool_progress": "all",
         "skin": "default",
         # UI language for static user-facing messages (approval prompts, a
         # handful of gateway slash-command replies).  Does NOT affect agent
@@ -2005,6 +2022,16 @@ DEFAULT_CONFIG = {
         # tool name. Applies to CLI spinner + gateway/desktop tool-progress.
         # Custom/plugin/MCP tools always fall back to the raw preview.
         "friendly_tool_labels": True,
+        # CLI-only post-turn accounting line printed after each interactive turn:
+        # "⋯ 12.4s · edited 2 files +18 -3 · read 4 files · ran 3 commands".
+        # Observed from the tool-progress feed the CLI already receives; never
+        # printed in quiet/non-interactive paths or in gateway/messaging
+        # surfaces (those have their own runtime footer).
+        "turn_summary": True,
+        # CLI-only: append cumulative turn output tokens to the live spinner
+        # timer ("⚡ Reading file  ( 2.3s · ↓ 1.2k tok)"). Updates as each API
+        # call in the turn reports usage.
+        "spinner_token_flow": True,
         # How gateway tool-progress is grouped on platforms that support message
         # editing: "accumulate" (default) edits one bubble in place; "separate"
         # sends one message per tool (the pre-v0.9 behavior, noisier). Only
@@ -2295,15 +2322,37 @@ DEFAULT_CONFIG = {
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
         "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        # Global language hint applied to EVERY provider unless a per-provider
+        # language overrides it. Defaults to "en" — Whisper auto-detection
+        # frequently misidentifies short/accented clips, which reads as
+        # "STT transcribed the wrong language". Set to "" to restore
+        # auto-detect, or to your language code ("es", "zh", "uk", ...).
+        "language": "en",
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+            "initial_prompt": "",
+            # Anti-hallucination hardening (faster-whisper decodes junk tokens
+            # from silence/noise without these):
+            "vad": True,  # Silero VAD filter — silence never reaches whisper. false = old raw behavior (music/ambient).
+            "vad_min_silence_ms": 500,  # min silence (ms) that splits speech chunks when vad is on
+            "no_speech_prob_threshold": 0.6,  # drop a segment only if no_speech_prob is ABOVE this...
+            "logprob_threshold": -1.0,  # ...AND its avg_logprob is BELOW this (both must hit)
+        },
+        "groq": {
+            "model": "whisper-large-v3-turbo",  # whisper-large-v3, whisper-large-v3-turbo, distil-whisper-large-v3-en
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "openai": {
-            "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe
+            "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "xai": {
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "elevenlabs": {
             "model_id": "scribe_v2",  # scribe_v2, scribe_v1
@@ -2322,9 +2371,50 @@ DEFAULT_CONFIG = {
         "max_recording_seconds": 120,
         "auto_tts": False,
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
+        "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
         "silence_threshold": 200,     # RMS below this = silence (0-32767)
         "silence_duration": 3.0,      # Seconds of silence before auto-stop
         "barge_in": True,             # Stop TTS playback when the user starts talking
+        # Saying EXACTLY one of these phrases (and nothing else) ends the
+        # voice chat instead of being sent to the agent. Case-insensitive,
+        # surrounding punctuation ignored. Set [] to disable.
+        "stop_phrases": ["stop"],
+    },
+
+    # "Hey Hermes" hands-free wake word. Always-on, on-device hotword
+    # detection that starts a fresh voice session — the "Hey Siri" pattern.
+    # Off by default; toggle with /wake or `wake_word.enabled: true`.
+    "wake_word": {
+        "enabled": False,
+        "surface": "auto",            # eligible surface: "auto" (first claimant) | "cli" | "tui" | "gui"
+        "provider": "openwakeword",   # "openwakeword" (free, local) | "sherpa" (free, ANY phrase, no training) | "porcupine" (premium; needs PORCUPINE_ACCESS_KEY)
+        "phrase": "hey hermes",       # for "sherpa" this IS the detected phrase (any text works); for other engines it's a cosmetic label — detection is keyed by the model/keyword below
+        "sensitivity": 0.6,           # 0.0-1.0 detection threshold, consistent across engines (higher = stricter, fewer false triggers)
+        "confirmation_frames": 3,     # openWakeWord only: consecutive over-threshold frames required to fire (higher = fewer false triggers on ambient speech, slightly more latency; 1 = old single-frame behavior)
+        "start_new_session": True,    # start a fresh session on wake vs. continue the current one
+        "profile_routing": True,      # sherpa only: also listen for every wake-enabled profile's phrase and route the wake to the matching profile
+        "openwakeword": {
+            # "hey_hermes" (the bundled, works-out-of-the-box default) OR a
+            # built-in openWakeWord name ("hey_jarvis", "alexa", "hey_mycroft",
+            # ...) OR a path to a custom .onnx/.tflite model for another phrase.
+            # See the wake-word docs for the custom-model training guide.
+            "model": "hey_hermes",
+            # "" (auto — tflite on macOS ARM64, onnx elsewhere) | "onnx" | "tflite".
+            # openWakeWord's onnx backend scores near-zero on macOS ARM64
+            # (dscripka/openWakeWord#336), so auto avoids a listener that arms
+            # but never fires. Set explicitly only to override that choice.
+            "inference_framework": "",
+        },
+        "sherpa": {
+            # Optional path to a sherpa-onnx KWS model directory. Empty =
+            # auto-download the small English zipformer model on first use.
+            "model_dir": "",
+        },
+        "porcupine": {
+            # Built-in keyword ("jarvis", "computer", "bumblebee", ...) or a path
+            # to a custom .ppn from the Picovoice Console.
+            "keyword": "jarvis",
+        },
     },
     
     "human_delay": {
@@ -2669,6 +2759,13 @@ DEFAULT_CONFIG = {
         # override: DISCORD_APPROVAL_MENTIONS. Default false avoids surprise
         # pings.
         "approval_mentions": False,
+        # Discord voice-channel inactivity timeout, in seconds. Set to 0 to
+        # keep the bot in VC until an explicit `/voice leave` / disconnect.
+        "voice_channel_inactivity_timeout_seconds": 300,
+        # Minimum seconds to wait for a VC playback before force-stopping it.
+        # The adapter also probes clip duration and extends this floor by a
+        # padding window, so long TTS readbacks are not cut at exactly 120s.
+        "voice_playback_timeout_seconds": 120,
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and
@@ -2745,6 +2842,20 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        # Operator-customizable policy text for smart approvals. When
+        # non-empty, this is appended to the smart-approval guardian's
+        # SYSTEM prompt (trusted channel) as additional rules — e.g.
+        # "Always ESCALATE commands touching /etc" or "APPROVE docker
+        # compose restarts under ~/deploys". Inspired by ChatGPT Work's
+        # customizable auto-review guardian policy.
+        "smart_policy": "",
+        # Consecutive-denial circuit breaker for smart approvals: after this
+        # many guardian DENY verdicts in a row within one session, the deny
+        # message returned to the model escalates to a hard-stop instruction
+        # (report to the user / ask for manual run or /approve) instead of a
+        # plain "Do NOT retry". Any approval resets the count. 0 disables.
+        # Inspired by ChatGPT Work's auto-review circuit breaker.
+        "denial_breaker_threshold": 3,
         # User-defined deny rules: fnmatch globs matched against terminal
         # commands. A match blocks the command unconditionally — BEFORE the
         # --yolo / /yolo / mode=off bypass — making this the user-editable
@@ -2845,6 +2956,21 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Fail closed when an unpinned job's current global model/provider
+        # differs from its creation-time snapshot. This prevents unattended
+        # jobs from silently inheriting a paid default. Set to false only when
+        # jobs should deliberately track changing global inference defaults.
+        "model_drift_guard": True,
+        # Default inference model for cron jobs (Axis A — WHAT model an
+        # agent job runs on). Resolution at fire time: per-job user pin >
+        # cron.model > global model.default. When set, unpinned jobs follow
+        # this deliberately, so the #44585 model-drift fail-closed guard does
+        # not engage for the model axis — cron spend no longer shadows chat
+        # `/model` switches. Empty string = fall through to model.default.
+        "model": "",
+        # Inference provider paired with cron.model (NOT the scheduler
+        # provider below). Empty string = resolve from global config.
+        "model_provider": "",
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or
@@ -2920,6 +3046,14 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Auto-subscribe the originating gateway/TUI session to task
+        # completion + block events when ``kanban_create`` is called from
+        # inside a session that has a persistent delivery channel. The
+        # agent that dispatched the task will get notified automatically
+        # instead of having to poll. Disable to mirror pre-feature
+        # behaviour — e.g. for a profile that prefers explicit
+        # ``kanban_notify-subscribe`` calls per task.
+        "auto_subscribe_on_create": True,
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
@@ -3001,22 +3135,40 @@ DEFAULT_CONFIG = {
     # openclaw-tool-search-report PDF in this PR for the rationale.
     "tools": {
         "tool_search": {
-            # "auto" (default) — activate only when deferrable tool schemas
-            #   exceed ``threshold_pct`` of the active model's context length,
-            #   so small toolsets pay no overhead.
-            # "on"  — always activate when there is at least one deferrable
-            #   tool. Use when you have many MCP servers and want maximum
-            #   token reduction unconditionally.
+            # Tiered disclosure: any deferrable (MCP/plugin) tool activates
+            # the bridge; the listing then scales with catalog size.
+            #   Tier 0 — no MCP/plugin tools: everything stays eager.
+            #   Tier 1 — catalog listing fits the budget: bridge + skills-style
+            #     name+description manifest (degrades to names-only).
+            #   Tier 2 — per-tool listing over budget even names-only (e.g.
+            #     Cloudflare's ~3,300-tool flat API surface): bare bridge +
+            #     a one-line-per-server summary (name + tool count) so the
+            #     model knows which domains are reachable; individual tools
+            #     discoverable through tool_search only.
+            # "auto"/"on" — activate when at least one deferrable tool exists.
             # "off" — disable entirely. Tools-array assembly is a pass-through.
             "enabled": "auto",
-            # Percentage of context length at which "auto" mode kicks in.
-            # 10 matches the Claude Code default. Range 0..100.
-            "threshold_pct": 10,
+            # Listing budget as a percentage of the active model's context
+            # length. Effective budget = min(this % of context,
+            # listing_max_tokens). Range 0..100.
+            "threshold_pct": 5,
             # When the model calls tool_search without a ``limit`` argument,
             # how many hits to return. Range 1..max_search_limit.
             "search_default_limit": 5,
             # Hard upper bound the model can request via ``limit``. Range 1..50.
             "max_search_limit": 20,
+            # Skills-style catalog listing embedded in the tool_search bridge
+            # description: every deferred tool's name + first sentence of its
+            # description (≤60 chars), grouped by MCP server / toolset. Keeps
+            # capabilities discoverable while schemas stay deferred.
+            # "auto" (default) — include when the listing fits the budget
+            #   (falls back to names-only, then to the bare tier-2 bridge).
+            # "on"  — same rendering, but explicit intent to always list.
+            # "off" — always the bare bridge (tier 2 for every catalog).
+            "listing": "auto",
+            # Absolute cap on the embedded listing in tokens (chars/4
+            # estimate), regardless of context size. Range 200..60000.
+            "listing_max_tokens": 20000,
         },
     },
 
@@ -3253,14 +3405,15 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
-        # When true, prune ended sessions older than retention_days once
+        # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
-        # Only touches ended sessions — active sessions are always preserved.
+        # Activity is the latest message timestamp, falling back to creation
+        # time for empty sessions. Active sessions are always preserved.
         # Default false: session history is valuable for search recall, and
         # silently deleting it could surprise users.  Opt in explicitly.
         "auto_prune": False,
-        # How many days of ended-session history to keep.  Matches the
-        # default of ``hermes sessions prune``.
+        # How many inactive days of ended-session history to keep. Matches
+        # the default of ``hermes sessions prune``.
         "retention_days": 90,
         # When true, auto-archive (soft-hide, never delete) sessions that
         # haven't been touched in ``auto_archive_days`` days, once per
@@ -3335,6 +3488,14 @@ DEFAULT_CONFIG = {
         # reads connected accounts silently). "off" -> plain intro only.
         # The offer fires at most once (latched under onboarding.seen).
         "profile_build": "ask",
+    },
+
+    # Privacy-safe aggregate metrics written only to this profile's local
+    # telemetry directory. Collection is opt-in and no remote sink exists.
+    "telemetry": {
+        "shared_metrics": {
+            "enabled": False,
+        },
     },
 
     # ``hermes update`` behaviour.
@@ -3668,6 +3829,15 @@ DEFAULT_CONFIG = {
         #   false   - always keep GPU acceleration on, even over a remote display.
         # Bridged to the HERMES_DESKTOP_DISABLE_GPU env var the Electron app reads.
         "disable_gpu": "auto",
+        # macOS only: optional persistent code-signing identity (a cert in the
+        # login keychain — a self-signed "Code Signing" cert from Keychain
+        # Access works; no Apple Developer account needed) used to re-sign
+        # locally rebuilt desktop apps. A certificate-anchored Designated
+        # Requirement stays stable across rebuilds, so TCC grants (Full Disk
+        # Access, Desktop/Downloads/Documents, Accessibility, Automation,
+        # microphone) survive every update. Empty keeps the default stable
+        # ad-hoc signing (identifier-pinned requirement).
+        "macos_signing_identity": "",
         # Auto-continue a turn that was killed mid-run by an app/backend/machine
         # crash: resuming that session re-submits the interrupted prompt (shown
         # as a "resumed interrupted turn" event) if the interruption is fresh.
@@ -4316,6 +4486,13 @@ OPTIONAL_ENV_VARS = {
         "description": "Mistral API key for Voxtral TTS and transcription (STT)",
         "prompt": "Mistral API key",
         "url": "https://console.mistral.ai/",
+        "password": True,
+        "category": "tool",
+    },
+    "PORCUPINE_ACCESS_KEY": {
+        "description": "Picovoice access key for the Porcupine 'Hey Hermes' wake word engine (optional; openWakeWord is the free default)",
+        "prompt": "Picovoice access key",
+        "url": "https://console.picovoice.ai/",
         "password": True,
         "category": "tool",
     },
@@ -8760,6 +8937,135 @@ def edit_config():
     subprocess.run([editor, str(config_path)])
 
 
+def _cron_model_drift_axis_for_config_key(key: str) -> Optional[str]:
+    """Return the cron drift guard axis affected by a config key, if any."""
+    normalized = str(key or "").strip().lower()
+    if normalized in {"model", "model.default", "model.model", "model.name"}:
+        return "model"
+    if normalized in {"model.provider", "provider"}:
+        return "provider"
+    return None
+
+
+def cron_model_drift_guard_enabled(
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Return whether cron must fail closed on unpinned inference drift.
+
+    Only the literal YAML boolean ``false`` disables this spend-safety guard.
+    Missing, malformed, or non-boolean values stay fail-closed. When *config*
+    is omitted, load the active merged configuration so CLI warnings honor the
+    same user/managed setting as the scheduler.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return True
+    if not isinstance(config, dict):
+        return True
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return True
+    return cron_config.get("model_drift_guard", True) is not False
+
+
+def _cron_fleet_default_covers_axis(
+    axis: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """True when cron.model / cron.model_provider covers *axis*.
+
+    An axis covered by the explicit cron-fleet default no longer follows the
+    global model/provider at fire time, so the drift guard never engages for
+    it and switch-time warnings would be false alarms.
+    """
+    if config is None:
+        try:
+            config = load_config()
+        except Exception:
+            return False
+    if not isinstance(config, dict):
+        return False
+    cron_config = config.get("cron")
+    if not isinstance(cron_config, dict):
+        return False
+    key = "model" if axis == "model" else "model_provider"
+    value = cron_config.get(key)
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _load_cron_jobs_for_config_warning() -> List[Dict[str, Any]]:
+    """Best-effort read of the active profile's cron jobs database.
+
+    Delegates to ``cron.jobs.load_jobs`` to reuse its BOM handling, corruption
+    repair, and context-local store resolution (tests, embedders). Falls back
+    to an empty list on any failure so config writes never break.
+    """
+    try:
+        from cron.jobs import load_jobs
+        return load_jobs()
+    except Exception:
+        return []
+
+
+def warn_unpinned_cron_jobs_after_model_config_change(
+    key: str,
+    value: Any,
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Warn when a global model/provider change will trip cron's drift guard.
+
+    Cron intentionally fails closed when an unpinned agent job's current global
+    model/provider differs from its creation-time snapshot. Surface that outcome
+    when the operator changes the global axis instead of letting the next tick
+    be the first visible signal.
+    """
+    axis = _cron_model_drift_axis_for_config_key(key)
+    if axis is None:
+        return
+    if not cron_model_drift_guard_enabled(config):
+        return
+    # A cron-fleet default covering this axis (cron.model /
+    # cron.model_provider) means unpinned jobs no longer follow the global
+    # value at all — the drift guard will not engage, so warning here would
+    # be a false alarm.
+    if _cron_fleet_default_covers_axis(axis, config):
+        return
+
+    new_value = str(value or "").strip().lower()
+    if not new_value:
+        return
+
+    pinned_field = axis
+    snapshot_field = f"{axis}_snapshot"
+    affected = 0
+    for job in _load_cron_jobs_for_config_warning():
+        if not job.get("enabled", True):
+            continue
+        if job.get("no_agent"):
+            continue
+        if str(job.get(pinned_field) or "").strip():
+            continue
+        snapshot = str(job.get(snapshot_field) or "").strip().lower()
+        if snapshot and snapshot != new_value:
+            affected += 1
+
+    if affected <= 0:
+        return
+
+    noun = "job" if affected == 1 else "jobs"
+    verb = "has" if affected == 1 else "have"
+    print(
+        f"⚠️  {affected} enabled unpinned cron {noun} {verb} stored "
+        f"{snapshot_field} values that differ from the new global {axis}. "
+        "They will fail closed on their next run instead of silently using the "
+        "changed model/provider. Inspect with `hermes cron list`, then pin the "
+        "intended values with `cronjob action=update job_id=<job_id> "
+        "provider=<provider> model=<model>`."
+    )
+
+
 def _default_value_for_key(dotted_key: str):
     """Return the leaf value declared for *dotted_key* in ``DEFAULT_CONFIG``.
 
@@ -9074,6 +9380,7 @@ def set_config_value(key: str, value: str, force: bool = False):
     else:
         _display_value = value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
+    warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the
     # user the runtime may never read it and suggest the likely-intended path.

@@ -569,10 +569,15 @@ def _compute_tool_definitions(
                 config=ts_cfg,
             )
             if assembly.activated and not quiet_mode:
+                _forms = {"full": "catalog listing embedded",
+                          "names": "names-only listing embedded",
+                          "mixed": "listing embedded (oversized servers summarized)",
+                          "groups": "server summary embedded (search-only discovery)",
+                          "none": "no listing (search-only)"}
                 print(
-                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
-                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
-                    f"Threshold ~{assembly.threshold_tokens} tokens."
+                    f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
+                    f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
+                    f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
@@ -725,6 +730,16 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     properties = (schema.get("parameters") or {}).get("properties")
     if not properties:
         return args
+
+    # The model saw the SANITIZED schema — property keys violating provider
+    # patterns (e.g. Cloudflare's ``issue_class~neq``) were renamed before
+    # the request. Map any sanitized keys back to the registry's original
+    # wire names before schema lookup / dispatch.
+    try:
+        from tools.schema_sanitizer import unrename_tool_args
+        args = unrename_tool_args(schema.get("parameters"), args)
+    except Exception:  # pragma: no cover — never break dispatch
+        pass
 
     for key, value in list(args.items()):
         prop_schema = properties.get(key)
@@ -1041,7 +1056,7 @@ def _emit_post_tool_call_hook(
     listener will actually consume it).
     """
     try:
-        from hermes_cli.plugins import has_hook, invoke_hook
+        from hermes_cli.lifecycle import has_hook, invoke_hook
         if not has_hook("post_tool_call"):
             return
         if status is None:
@@ -1078,6 +1093,7 @@ def handle_function_call(
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
+    skip_tool_execution_middleware: bool = False,
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -1170,6 +1186,12 @@ def handle_function_call(
                         "Use tool_search to find tools you can call."
                     ),
                 }, ensure_ascii=False)
+            # Probe-validate against the deferred tool's schema (ironclaw#5149):
+            # a blind call missing required arguments returns the parameter
+            # schema instead of dispatching into an opaque downstream failure.
+            _probe_err = _ts_mod.validate_deferred_call_args(underlying_name, underlying_args)
+            if _probe_err is not None:
+                return _probe_err
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(
@@ -1182,6 +1204,7 @@ def handle_function_call(
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
+                skip_tool_execution_middleware=skip_tool_execution_middleware,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
@@ -1320,19 +1343,22 @@ def handle_function_call(
                         session_id=session_id,
                         user_task=user_task,
                     )
-            from hermes_cli.middleware import run_tool_execution_middleware
+            if skip_tool_execution_middleware:
+                result = _dispatch(function_args)
+            else:
+                from hermes_cli.middleware import run_tool_execution_middleware
 
-            result = run_tool_execution_middleware(
-                function_name,
-                function_args,
-                _dispatch,
-                original_args=_tool_original_args,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-                turn_id=turn_id or "",
-                api_request_id=api_request_id or "",
-            )
+                result = run_tool_execution_middleware(
+                    function_name,
+                    function_args,
+                    _dispatch,
+                    original_args=_tool_original_args,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    turn_id=turn_id or "",
+                    api_request_id=api_request_id or "",
+                )
         finally:
             if _approval_tokens is not None and reset_current_observability_context is not None:
                 try:
@@ -1363,7 +1389,7 @@ def handle_function_call(
         # Gated on has_hook so the no-listener path skips both the result
         # field derivation and the payload dispatch.
         try:
-            from hermes_cli.plugins import has_hook, invoke_hook
+            from hermes_cli.lifecycle import has_hook, invoke_hook
             if has_hook("transform_tool_result"):
                 status, error_type, error_message = _tool_result_observer_fields(result)
                 hook_results = invoke_hook(

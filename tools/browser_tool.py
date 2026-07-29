@@ -66,7 +66,11 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
 from agent.redact import redact_cdp_url
-from hermes_constants import agent_browser_runnable, get_hermes_home
+from hermes_constants import (
+    agent_browser_runnable,
+    get_hermes_home,
+    get_hermes_home_override,
+)
 from utils import env_int, is_truthy_value
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -457,6 +461,45 @@ def _resolve_cdp_override(cdp_url: str) -> str:
     return raw
 
 
+def _get_cdp_override_raw() -> str:
+    """Return the *configured* CDP override without any network I/O.
+
+    Precedence is:
+    1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
+    2. ``browser.cdp_url`` in config.yaml (persistent config)
+
+    This is the availability-check variant: callers that only need to know
+    *whether* a CDP override is configured (tool ``check_fn`` gates,
+    ``_is_local_mode`` / ``_is_local_backend`` routing decisions,
+    ``hermes doctor``) MUST use this instead of :func:`_get_cdp_override`.
+
+    Rationale: ``_get_cdp_override`` resolves the endpoint over HTTP
+    (``/json/version`` discovery, 10s timeout). Tool-schema assembly runs at
+    every CLI/Desktop startup and probes several browser-family check_fns;
+    when a *stale* ``browser.cdp_url`` points at a dead endpoint (the debug
+    Chrome it referenced is long gone), each check blocked on a failing
+    socket connect and startup stalled for 10+ seconds before the banner —
+    with no error, just mystery slowness. Same principle as the existing
+    "do not execute ``agent-browser --version`` here" rule in
+    ``check_browser_requirements``: no side effects during schema build.
+    """
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception as e:
+        logger.debug("Could not read browser.cdp_url from config: %s", e)
+
+    return ""
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
@@ -467,22 +510,16 @@ def _get_cdp_override() -> str:
     When either is set, we skip both Browserbase and the local headless
     launcher and connect directly to the supplied Chrome DevTools Protocol
     endpoint.
+
+    NOTE: resolution may perform an HTTP ``/json/version`` discovery request.
+    Only call this on paths that are about to *connect* (session creation,
+    supervisor attach). Pure is-it-configured gates must use
+    :func:`_get_cdp_override_raw`.
     """
-    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if env_override:
-        return _resolve_cdp_override(env_override)
-
-    try:
-        from hermes_cli.config import read_raw_config
-
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            return _resolve_cdp_override(str(browser_cfg.get("cdp_url", "") or ""))
-    except Exception as e:
-        logger.debug("Could not read browser.cdp_url from config: %s", e)
-
-    return ""
+    raw = _get_cdp_override_raw()
+    if not raw:
+        return ""
+    return _resolve_cdp_override(raw)
 
 
 def _get_dialog_policy_config() -> Tuple[str, float]:
@@ -789,7 +826,7 @@ def _termux_browser_install_error() -> str:
 
 def _is_local_mode() -> bool:
     """Return True when the browser tool will use a local browser backend."""
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     return _get_cloud_provider() is None
 
@@ -821,7 +858,7 @@ def _is_local_backend() -> bool:
     # config (both via _get_cdp_override(), and both now suppress camofox in
     # browser_camofox.py). _is_local_mode() already treats any CDP override as
     # non-local; keep the two helpers in agreement.
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return False
     if _is_camofox_mode():
         return True
@@ -1313,7 +1350,7 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     """
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override():
+    if _get_cdp_override_raw():
         return task_id
     if _is_camofox_mode():
         return task_id
@@ -1386,26 +1423,39 @@ def _last_session_key(task_id: str) -> str:
 def _allow_private_urls() -> bool:
     """Return whether the browser is allowed to navigate to private/internal addresses.
 
-    Reads ``config["browser"]["allow_private_urls"]`` once and caches the result
-    for the process lifetime.  Defaults to ``False`` (SSRF protection active).
+    Reads ``config["browser"]["allow_private_urls"]``. Single-profile calls
+    cache the result for the process lifetime; multiplexed profile turns resolve
+    their context-local config on each call. Defaults to ``False`` (SSRF
+    protection active).
     """
     global _cached_allow_private_urls, _allow_private_urls_resolved
+
+    # The profile multiplexer scopes config with a ContextVar while sharing
+    # this module. Never reuse another profile's private-network opt-out.
+    if get_hermes_home_override() is not None:
+        return _resolve_allow_private_urls()
+
     if _allow_private_urls_resolved:
         return _cached_allow_private_urls
 
     _allow_private_urls_resolved = True
-    _cached_allow_private_urls = False  # safe default
+    _cached_allow_private_urls = _resolve_allow_private_urls()
+    return _cached_allow_private_urls
+
+
+def _resolve_allow_private_urls() -> bool:
+    """Read the browser private-URL toggle from the active config scope."""
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
         browser_cfg = cfg.get("browser", {})
         if isinstance(browser_cfg, dict):
-            _cached_allow_private_urls = is_truthy_value(
+            return is_truthy_value(
                 browser_cfg.get("allow_private_urls"), default=False
             )
     except Exception as e:
         logger.debug("Could not read allow_private_urls from config: %s", e)
-    return _cached_allow_private_urls
+    return False
 
 
 def _socket_safe_tmpdir() -> str:
@@ -4740,7 +4790,9 @@ def check_browser_requirements() -> bool:
 
     # CDP override mode can connect to an existing remote/local browser endpoint
     # without requiring the local agent-browser binary on PATH.
-    if _get_cdp_override():
+    # Raw (no-I/O) check: this runs during tool-schema assembly at startup,
+    # where a stale endpoint must not cost a blocking HTTP probe.
+    if _get_cdp_override_raw():
         return True
 
     # The agent-browser CLI is required for local launch and cloud-provider flows.
