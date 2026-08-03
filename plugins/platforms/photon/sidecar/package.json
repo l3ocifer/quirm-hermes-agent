@@ -10,16 +10,16 @@
     "postinstall": "node patch-spectrum-mixed-attachments.mjs"
   },
   "engines": {
-    "node": ">=18.17"
+    "node": ">=18.20.8"
   },
   "dependencies": {
-    "spectrum-ts": "8.0.0"
+    "spectrum-ts": "8.2.2"
   },
   "overrides": {
-    "protobufjs": "8.6.1",
-    "@opentelemetry/otlp-transformer": "0.218.0",
-    "@opentelemetry/otlp-exporter-base": "0.218.0",
-    "@opentelemetry/exporter-trace-otlp-http": "0.218.0",
-    "@opentelemetry/exporter-logs-otlp-http": "0.218.0"
+    "protobufjs": "8.7.1",
+    "@opentelemetry/otlp-transformer": "0.221.0",
+    "@opentelemetry/otlp-exporter-base": "0.221.0",
+    "@opentelemetry/exporter-trace-otlp-http": "0.221.0",
+    "@opentelemetry/exporter-logs-otlp-http": "0.221.0"
   }
 }
