@@ -72,7 +72,12 @@ RUN uv pip install --system --no-cache -e "." \
       pandas \
       numpy \
       matplotlib \
-      scikit-learn
+      scikit-learn \
+ # Something in the fresh (non-lockfile) resolution drags in urllib3-future,
+ # which overwrites the urllib3 package namespace and crashes hermes at boot
+ # (ImportError: _TYPE_SOCKET_OPTIONS). Reinstall real urllib3 last so it wins.
+ && uv pip uninstall --system urllib3-future 2>/dev/null || true \
+ && uv pip install --system --no-cache --reinstall "urllib3>=2.7.0,<3"
 
 # Create hermes user
 RUN useradd -m -u 1000 -s /bin/bash hermes \
