@@ -58,7 +58,11 @@ RUN pip install --no-cache-dir uv
 WORKDIR /opt/hermes
 COPY . .
 
-RUN uv pip install --system --no-cache "." \
+# Editable install: upstream hermes-agent blocks wheel/sdist builds since the
+# 2026-08 sync ("distributed via shell installer, Docker, or Nix") and directs
+# container builds to `uv pip install -e .`. Source stays in the image, so -e
+# is equivalent here.
+RUN uv pip install --system --no-cache -e "." \
       pgvector \
       psycopg2-binary \
       "mautrix[encryption]==0.21.0" \
