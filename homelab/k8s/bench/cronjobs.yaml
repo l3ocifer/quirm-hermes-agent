@@ -51,6 +51,16 @@
 # (it expects the existing resource to come from a parent base).
 # Letting the generator create it fresh is simpler and keeps the
 # scripts as the single source of truth.
+#
+# ── SUSPENDED 2026-08-22 (until alef's 3090 is back) ─────────────────────
+# The loop's runs average ~30K tokens and it fires every 5 min, so it held
+# the ONLY GPU lane (`chat` on thebeast, 2 slots) continuously and starved
+# interactive callers (Cursor, Hermes on the laptops) — measured: 46 lane
+# tasks / 30 min, avg 32K tokens, both slots busy; laptop turns queued
+# minutes. Unattended research is the lowest-priority consumer, so both
+# CronJobs carry `suspend: true` until alef provides a second lane
+# (homelab: docs/alef-bringup.md); then point the bench at the alef lane
+# and flip suspend back to false. Existing queue rows are kept.
 ---
 apiVersion: batch/v1
 kind: CronJob
@@ -62,6 +72,7 @@ metadata:
     app.kubernetes.io/component: runner
 spec:
   schedule: "*/5 * * * *"      # every 5m (fleet floor; runner self-drains per tick)
+  suspend: true                # 2026-08-22: GPU lane contention — see header
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 30
   successfulJobsHistoryLimit: 3
@@ -143,6 +154,7 @@ metadata:
     app.kubernetes.io/component: proposer
 spec:
   schedule: "*/30 * * * *"     # every 30 minutes
+  suspend: true                # 2026-08-22: GPU lane contention — see header
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 60
   successfulJobsHistoryLimit: 3
