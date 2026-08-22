@@ -9,7 +9,9 @@ metadata:
     app.kubernetes.io/component: agent
     app.kubernetes.io/part-of: agents
 spec:
-  replicas: 1
+  # PAUSED 2026-08-22 — inference lane reserved for laptop/dev setup until alef's 3090
+  # is back. Reversal: `git revert` this commit (see homelab docs/agents-inference-pause.md).
+  replicas: 0  # was: replicas: 1
   strategy:
     type: Recreate                    # state PVC is RWO
   selector:
