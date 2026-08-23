@@ -5,18 +5,18 @@ metadata:
   name: quirm
   namespace: agents-shared
 spec:
-  entryPoints: [websecure]
+  # Cloudflare terminates TLS and the tunnel speaks plain HTTP to Traefik's
+  # `web` entrypoint; a websecure-only router, a `tls:` block (TLS-only
+  # routers on every entrypoint) or a cross-namespace middleware ref
+  # (allowCrossNamespace is off) each make Traefik drop the router -> 404.
+  entryPoints: [web]
   routes:
     - match: Host(`quirm.leopaska.xyz`)
       kind: Rule
       services:
         - { name: quirm, port: 3001 }
       middlewares:
-        - { name: authelia, namespace: authelia }
-  tls:
-    secretName: quirm-leopaska-tls
-    domains:
-      - main: quirm.leopaska.xyz
+        - { name: authelia }   # agents-shared copy (homelab infrastructure/authelia-middleware.yaml)
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
