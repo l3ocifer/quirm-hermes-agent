@@ -31,6 +31,20 @@ spec:
           args:
             - |
               set -eu
+              # 2026-08-23: no-op while the agent is paused (replicas 0, see
+              # homelab docs/agents-inference-pause.md). Without this the Sync
+              # hook fails on every ArgoCD sync and the app sits in op=Failed,
+              # hiding real failures.
+              if ! python - <<'PY'
+              import os, socket, sys, urllib.parse
+              u = urllib.parse.urlparse(os.environ["AGENT_API"])
+              try:
+                  socket.create_connection((u.hostname, u.port or 80), timeout=5).close()
+              except OSError as e:
+                  print(f"{u.hostname}:{u.port} unreachable ({e}) - agent paused? skipping reconcile", file=sys.stderr)
+                  sys.exit(1)
+              PY
+              then exit 0; fi
               pip install --quiet --no-cache-dir 'httpx==0.28.*' 'tomli==2.*'
               exec python /scripts/reconcile.py
           env:
