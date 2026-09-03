@@ -16,6 +16,11 @@ on:
       - ".forgejo/workflows/homelab-build.yml"
   workflow_dispatch: {}
 
+# Forgejo's default for on.push cancels the previous run; queue instead.
+concurrency:
+  group: homelab-build-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY_PUBLIC: git.leopaska.xyz
   REGISTRY_INTERNAL: forgejo-http.forgejo.svc.cluster.local:3000
@@ -24,9 +29,35 @@ env:
 jobs:
   build-and-push:
     runs-on: docker
+    outputs:
+      superseded: ${{ steps.head.outputs.superseded }}
+      sha: ${{ steps.head.outputs.sha }}
 
     steps:
+      # Multi-agent landing: several agents can push to main minutes apart.
+      # Forgejo's default cancel-in-progress would kill an in-flight build;
+      # the concurrency group above queues instead. This step skips the
+      # build entirely once a newer commit has already become HEAD, so a
+      # burst of pushes costs one full build — the newest.
+      - name: Is this commit still the branch HEAD?
+        id: head
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          apk add --no-cache git
+          sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          head_now="$(git ls-remote "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" "refs/heads/${GITHUB_REF_NAME}" | cut -c1-7)"
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          if [ -n "${head_now}" ] && [ "${head_now}" != "${sha}" ]; then
+            echo "superseded=true" >> "$GITHUB_OUTPUT"
+            echo "commit ${sha} is no longer ${GITHUB_REF_NAME} HEAD (${head_now}); the newer run builds it — nothing to do here"
+          else
+            echo "superseded=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build image and push via skopeo
+        if: steps.head.outputs.superseded != 'true'
         env:
           # The workflow token reads the repo; package writes use the shared
           # leo-owned PAT from Forgejo Actions secrets.
@@ -34,22 +65,26 @@ jobs:
           PACKAGE_TOKEN: ${{ secrets.FORGEJOPACKAGES }}
           # docker:27.5.1-cli reaches the dind sidecar via the bridge gateway.
           DOCKER_HOST: tcp://172.17.0.1:2375
+          SHORT_SHA: ${{ steps.head.outputs.sha }}
         run: |
           set -eu
           # Push over the cluster-internal Forgejo URL to avoid public-registry
           # chunked upload issues seen with Docker 27+.
           apk add --no-cache git skopeo
-          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
-            "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" repo
-          short_sha="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
+          # Build the exact commit the gate tested — not "branch HEAD at clone
+          # time", which under concurrent pushes could be a newer, untested tree.
+          git init -q repo
+          git -C repo fetch -q --depth 1 "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" "${GITHUB_SHA}"
+          git -C repo checkout -q FETCH_HEAD
 
           docker build \
             --tag "${REGISTRY_PUBLIC}/${IMAGE_NAME}:homelab" \
-            --tag "${REGISTRY_PUBLIC}/${IMAGE_NAME}:${short_sha}" \
+            --tag "${REGISTRY_PUBLIC}/${IMAGE_NAME}:${SHORT_SHA}" \
             --file repo/homelab/Dockerfile \
             repo
 
-          for tag in homelab "${short_sha}"; do
+          push_tag() {
+            tag="$1"
             archive="/tmp/${IMAGE_NAME##*/}-${tag}.tar"
             docker save "${REGISTRY_PUBLIC}/${IMAGE_NAME}:${tag}" -o "${archive}"
             skopeo copy --dest-tls-verify=false \
@@ -57,4 +92,17 @@ jobs:
               "docker-archive:${archive}:${REGISTRY_PUBLIC}/${IMAGE_NAME}:${tag}" \
               "docker://${REGISTRY_INTERNAL}/${IMAGE_NAME}:${tag}"
             rm -f "${archive}"
-          done
+          }
+
+          # Immutable sha tag: safe to push regardless of which run finishes last.
+          push_tag "${SHORT_SHA}"
+
+          # ':homelab' is the moving tag Image Updater tracks — only stamp it
+          # while this commit is still branch HEAD, so a slower older run can
+          # never overwrite a newer run's already-deployed image.
+          head_now="$(git ls-remote "http://${GITHUB_ACTOR}:${REPO_TOKEN}@${REGISTRY_INTERNAL}/${GITHUB_REPOSITORY}.git" "refs/heads/${GITHUB_REF_NAME}" | cut -c1-7)"
+          if [ -n "${head_now}" ] && [ "${head_now}" != "${SHORT_SHA}" ]; then
+            echo "branch HEAD moved to ${head_now}; skipping :homelab stamp — the newer run will stamp its own"
+            exit 0
+          fi
+          push_tag "homelab"
