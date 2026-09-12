@@ -69,8 +69,10 @@ LLM-as-judge is only trustworthy if it is **reproducible** and **unbiased**:
   *specific, stable* model — **not** "whatever inference lane happens to be
   free". This is the decisive reason the judge is a dedicated deployment.
 - **Cross-family from the candidates.** Self-preference bias (a model scoring
-  its own family higher) runs 10–25%. Candidates are Qwen (`long`, `frontier`,
-  `code`, `mac`) and Gemma (`chat`), so the judge must be a **third family**.
+  its own family higher) runs 10–25%. Candidates are Qwen (`long`, `code`,
+  `mac`), Gemma (`chat`), and GLM (`agent-quality`, was `frontier`/Qwen3-Coder
+  before the 2026-09-12 paradigm change), so the judge must be a **third
+  family** distinct from whichever candidate is under test.
   Initial judge: **Llama-3.1-8B-Instruct (4-bit MLX)** — proven MLX build,
   cross-family, cheap. Upgrade path: **Prometheus-2** (purpose-built rubric
   evaluator) once a clean MLX conversion is confirmed.

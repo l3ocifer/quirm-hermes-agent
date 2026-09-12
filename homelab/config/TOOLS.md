@@ -29,11 +29,18 @@ Configured aliases in `hermes.toml`:
 | `code` | benchmark code-quality evals + prototype generation |
 | `long` | long-context retrieval evals |
 | `embed` | embedding model for memory-search benchmarks |
-| `frontier` | gold-standard for grading rubric outputs |
+| `agent-quality` | gold-standard for grading rubric outputs (was `frontier`, now GLM-5.3) |
 
 Quirm does NOT pin to a specific model — that's the point of being
 the benchmarker. Whatever LiteLLM routes to is what production
 agents see, so what Quirm sees needs to be that.
+
+2026-09-12 paradigm: this agent's LiteLLM key is scoped to exactly
+`chat`, `agent`, `agent-fast`, `agent-quality`, `aux`, `long`, `code`,
+`embed`, `rerank`, `transcribe`. `frontier`, `auto`, `codex-*`,
+`gpt-5.5`, and direct Claude/OpenAI API keys are no longer available
+to agents -- those subscriptions now orchestrate only, not agent
+fallbacks.
 
 ## Communication channels
 

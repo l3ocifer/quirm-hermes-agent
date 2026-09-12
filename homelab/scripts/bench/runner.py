@@ -63,14 +63,15 @@ HTTP_TIMEOUT_S = int(os.environ.get("BENCH_HTTP_TIMEOUT_S", "180"))
 # ── Per-model HTTP timeout overrides (seconds) ───────────────────────────
 # This is an unattended agent research loop: we are never in a rush and we
 # care about *complete, gradable* answers, not speed. Slow CPU/MoE backends
-# (notably `frontier` = Qwen3-Coder-480B on llama.cpp/blade, ~1-2 tok/s)
+# (notably `agent-quality` = GLM-5.3 via CheaperInference; was `frontier`
+# = Qwen3-Coder-480B on llama.cpp/blade, ~1-2 tok/s)
 # need a far more generous ceiling than the fast vLLM lanes — otherwise the
 # response is cut off mid-generation and the grader scores a
 # truncated-but-correct answer 0, which poisons the model ranking.
 #
 # HOW TO TUNE (no code change needed — edit the runner CronJob):
 #   • Set BENCH_MODEL_TIMEOUTS to a JSON object, e.g.
-#       {"frontier": 1200, "long": 300, "code": 240}
+#       {"agent-quality": 1200, "long": 300, "code": 240}
 #     It is merged over the defaults below, so you only list overrides.
 #   • Any model not listed falls back to BENCH_HTTP_TIMEOUT_S.
 #   • CRITICAL: keep the job's activeDeadlineSeconds (cronjobs.yaml) greater
@@ -78,7 +79,7 @@ HTTP_TIMEOUT_S = int(os.environ.get("BENCH_HTTP_TIMEOUT_S", "180"))
 #     kills the pod mid-run and you are back to truncation.
 #   • If a run finishes with finish_reason == "length" it hit max_tokens,
 #     not the clock — raise the prompt's max_tokens, not the timeout.
-DEFAULT_MODEL_TIMEOUTS: dict[str, int] = {"frontier": 900, "long": 300}
+DEFAULT_MODEL_TIMEOUTS: dict[str, int] = {"agent-quality": 900, "long": 300}  # 2026-09-12 paradigm: was frontier
 try:
     MODEL_TIMEOUTS = {
         **DEFAULT_MODEL_TIMEOUTS,

@@ -6,11 +6,14 @@
 # Qwen3.5-9B-AWQ + DeltaNet, 262 K input ctx. Smaller-but-fast and
 # satisfies Hermes-Agent's hard ≥64 K context floor enforced in
 # run_agent.py L2020 (vllm-chat's 20 K ctx hits this and crashes the
-# agent loop).  `chat` (20 K, 27B) and `frontier` (65 K, 480B MoE)
+# agent loop).  `chat` (20 K, 27B) and `agent-quality` (65 K, GLM-5.3)
 # remain opt-in per-cron-task in hermes.toml via `model = "chat"` /
-# `model = "frontier"`.  Hermes' compressor uses the active model's
+# `model = "agent-quality"`.  Hermes' compressor uses the active model's
 # context_length below, so per-task overrides automatically get the
 # right window.
+# 2026-09-12 paradigm: `frontier` renamed to `agent-quality` below --
+# `frontier` is no longer in this agent's LiteLLM key allowlist;
+# SOTA/frontier subscriptions now orchestrate only.
 
 model:
   # 2026-05-12: vllm-long hanging (120s timeouts). Temporary chat default;
@@ -46,12 +49,12 @@ providers:
         # vllm-long (alef / RTX 3090) — Qwen3.5 9B AWQ + DeltaNet.
         # Native 262 K context. Use for big synthesis / long sessions.
         context_length: 262144
-      frontier:
-        # llamacpp-blade-frontier — unsloth Qwen3-Coder 480B-A35B GGUF
-        # Q4_K_M on dual Xeon E5-2667 v2. CPU-only, ~3-5 tok/s. Capped
-        # at 64 K ctx to keep KV in headroom; mirrors LiteLLM
-        # `frontier.model_info.max_input_tokens`. Already ≥64 K so no
-        # Hermes-floor lie needed.
+      agent-quality:
+        # 2026-09-12 paradigm: was `frontier` (llamacpp-blade-frontier,
+        # Qwen3-Coder 480B). Now CheaperInference GLM-5.3 via LiteLLM
+        # `agent-quality` (thinking on). Capped at 64 K ctx to keep KV in
+        # headroom; mirrors LiteLLM `agent-quality.model_info.max_input_tokens`.
+        # Already ≥64 K so no Hermes-floor lie needed.
         context_length: 65536
 
 # ── Autonomous dispatch→write_file path (mission deliverables) ──────────

@@ -51,7 +51,7 @@ DATABASE_URL = os.environ["DATABASE_URL"]
 DEFAULT_MODELS: list[dict[str, Any]] = [
     {"alias": "chat", "weight": 1.0, "tags": ["fast", "default"]},
     {"alias": "long", "weight": 0.7, "tags": ["long-context"]},
-    {"alias": "frontier", "weight": 0.3, "tags": ["expensive", "smart"]},
+    {"alias": "agent-quality", "weight": 0.3, "tags": ["expensive", "smart"]},  # 2026-09-12 paradigm: was frontier
     {"alias": "code", "weight": 0.8, "tags": ["code"]},
 ]
 

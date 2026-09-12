@@ -14,24 +14,29 @@ metrics_bind = "0.0.0.0:9100"
 
 [providers.litellm]
 # Fleet default is `chat` (vllm-chat / Qwen3.5 27B AWQ on thebeast).
-# `long` and `frontier` are opt-in per [[cron.tasks]] entry via
-# `model = "long"` / `model = "frontier"`. Frontier is intentionally
-# excluded from auto-fallbacks (CPU-only, ~3-5 tok/s).
+# `long` and `agent-quality` are opt-in per [[cron.tasks]] entry via
+# `model = "long"` / `model = "agent-quality"`. agent-quality is
+# intentionally excluded from auto-fallbacks (paid, opt-in only).
 #
 # Claude Code Max aliases route through claude-bridge
 # (homelab argocd/apps/_inference/55-claude-bridge.yaml). Bridge gates
 # against the household 7-window quota; on throttle/refusal LiteLLM
-# falls back to chat-thebeast → frontier-blade so callers always get a
+# falls back to chat-thebeast → agent-quality so callers always get a
 # response. Quirm's Vaultwarden virtual key is `quirm-claude` with
 # 22% of the household weekly Claude share. Use sparingly:
 #   - bench-digest-daily   (sonnet, 1×/day)
 #   - bench-weekly-review  (opus,    1×/week)
 #   - ad-hoc research memos (agent chooses Claude Code model at call time)
+#
+# 2026-09-12 paradigm: `frontier` (was llamacpp-blade-frontier, Qwen3-Coder
+# 480B) renamed to `agent-quality` (CheaperInference GLM-5.3, thinking on)
+# throughout this file -- `frontier` is no longer in this agent's LiteLLM
+# key allowlist; SOTA/frontier subscriptions now orchestrate only.
 base_url = "http://litellm.inference.svc.cluster.local:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 default_model = "chat"
 fallbacks = ["long"]
-models = ["chat", "long", "frontier", "claude-sonnet-max", "claude-opus-max", "claude-code/*", "embed", "rerank"]
+models = ["chat", "long", "agent-quality", "claude-sonnet-max", "claude-opus-max", "claude-code/*", "embed", "rerank"]
 
 [memory]
 backend = "postgres"
@@ -191,8 +196,8 @@ schedule = "0 6 * * *"
 # Claude Sonnet via Max subscription. Daily research synthesis is the
 # single most user-visible Quirm output (lands in Leo's morning iMessage)
 # so it gets the paid model. Falls back to local `chat-thebeast` then
-# `frontier-blade` if claude-bridge is throttled. See homelab
-# argocd/apps/_inference/55-claude-bridge.yaml for quota gating.
+# `agent-quality` (was `frontier-blade`) if claude-bridge is throttled.
+# See homelab argocd/apps/_inference/55-claude-bridge.yaml for quota gating.
 model    = "claude-sonnet-max"
 prompt   = """
 Daily benchmark digest, Karpathy-style. Read from `bench.experiments`
@@ -221,8 +226,8 @@ schedule = "0 9 * * 0"
 # Claude Opus via Max — only weekly Quirm Opus call. The weekly
 # methodology review needs the deepest reasoning available; Opus is
 # materially better at the "why did this prompt fail across every
-# model class" pattern recognition. Falls back to local `frontier`
-# if Opus is over its 7-day cap. See bridge quota policy.
+# model class" pattern recognition. Falls back to local `agent-quality`
+# (was `frontier`) if Opus is over its 7-day cap. See bridge quota policy.
 model    = "claude-opus-max"
 prompt   = """
 Weekly methodology review. Read bench.model_summary view + the past
@@ -243,24 +248,21 @@ catalog, also write a proposal to quirm-graph/pages/proposals/.
 delivery = ["bluebubbles"]
 
 [[cron.tasks]]
-name     = "bench-frontier-ceiling"
+# 2026-09-12 paradigm: was "bench-frontier-ceiling" / model = "frontier".
+# frontier is no longer in this agent's LiteLLM key allowlist -- renamed
+# to track agent-quality (CheaperInference GLM-5.3) as the new ceiling.
+name     = "bench-agent-quality-ceiling"
 schedule = "30 4 * * *"  # 04:30 — between Sancho (03:50) and the morning sweep
-model    = "frontier"
-# Karpathy-style "what's the ceiling?" pass. Once a day, queue a
-# frontier-pinned experiment for every prompt in `bench.prompts`
-# (skip ones with a fresh frontier run in the last 24h). The runner
-# CronJob picks them up. Establishes a per-prompt quality ceiling so
-# the daily digest can compare chat / long / frontier on the same
-# axis and flag regressions when a smaller model rivals frontier.
+model    = "agent-quality"
 prompt   = """
-Frontier ceiling pass. For every row in bench.prompts that does NOT
-already have a `bench.experiments` row with model='frontier' and
+Agent-quality ceiling pass. For every row in bench.prompts that does NOT
+already have a bench.experiments row with model='agent-quality' and
 status='done' AND finished_at > now() - interval '24 hours', insert:
 
   INSERT INTO bench.experiments
     (prompt_id, model, params, status, queued_at)
   VALUES
-    ($1, 'frontier',
+    ($1, 'agent-quality',
      '{"temperature": 0.2, "max_tokens": 2048}'::jsonb,
      'queued', now())
   ON CONFLICT DO NOTHING;
